@@ -1,3 +1,13 @@
-.vscode
-xfeat-flow
-seg_tracking
+# Generated data, models, and local environments
+runs/
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+CLAUDE.md
+
+# Third-party source checkouts (academic baselines and comparisons only; never committed).
+# The pipeline's own model dependencies are pinned pip packages in requirements.txt.
+third_party/
+scans/

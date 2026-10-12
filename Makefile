@@ -1,0 +1,382 @@
+.DEFAULT_GOAL := help
+
+PYTHON ?= python3
+# COLMAP 3.9.1: a local, user-space extraction of the Ubuntu package if present, else colmap on PATH.
+COLMAP_ROOT ?= $(firstword $(wildcard $(HOME)/.local/colmap-3.9.1 /tmp/colmap-local))
+COLMAP ?= $(if $(COLMAP_ROOT),$(COLMAP_ROOT)/usr/bin/colmap,colmap)
+COLMAP_LIB := $(if $(COLMAP_ROOT),$(COLMAP_ROOT)/usr/lib/x86_64-linux-gnu,)
+export LD_LIBRARY_PATH := $(if $(COLMAP_LIB),$(COLMAP_LIB):,)$(LD_LIBRARY_PATH)
+
+SCENE ?= london_bus
+# DTU: DATA=runs/real/dtu_dataset SEQ_ROOT=runs/real/dtu_benchmark SCENE=scan24
+DATA ?= runs/real/mobilebrick_dataset/test
+SEQ_ROOT ?= runs/real/mobilebrick_benchmark
+SEQ := $(SEQ_ROOT)/$(SCENE)
+# Inputs are RGB frames plus object masks; everything else is estimated.
+# Poses are solved on the full-resolution originals with keypoints from two
+# scales (fine detail where it is distinctive, coarse where it repeats, e.g.
+# patterned rugs), then the model is rescaled to the working frames.
+FEATURE_FRAMES ?= $(DATA)/$(SCENE)/image
+FEATURE_SCALES ?= 1,0.5
+# Keypoints per scale: 2048 x 2 scales halves mapper time against 4096 x 2 with
+# pose accuracy unchanged within noise (jeep, london_bus, porsche, DTU scan24).
+MAX_KEYPOINTS ?= 2048
+# Keypoints for pose estimation: superpoint, aliked or sift (all matched with LightGlue).
+FEATURES ?= superpoint
+# Estimated camera: simple_pinhole (one focal) or pinhole (separate x and y focal lengths).
+CAMERA_MODEL ?= simple_pinhole
+# estimate: one shared focal length from the images. dataset: the dataset's
+# per-frame intrinsics, for comparison only.
+INTRINSICS ?= estimate
+INTRINSICS_ARG := $(if $(filter dataset,$(INTRINSICS)),--calibration $(SEQ)/calibration.json --per-frame-intrinsics $(DATA)/$(SCENE)/intrinsic,)
+# Each frame's focal length is estimated from the images (phone lenses refocus
+# during capture). PER_FRAME_FOCAL= (empty) keeps one shared focal instead,
+# which suits fixed-focus cameras such as DTU's.
+PER_FRAME_FOCAL ?= 1
+# Which frame pairs are matched: sequential (video order, plus jumps) or exhaustive (every pair).
+PAIRS ?= sequential
+# NORMALIZE_DEPTH=D rescales the camera model so the median scene depth is D map units, so map-unit
+# settings fit captures of unknown scale (used by `make construct`; benchmarks already sit near 6-7).
+NORMALIZE_DEPTH ?=
+# REFINE_PP=1 also estimates the principal point instead of fixing it at the image centre.
+REFINE_PP ?=
+# LOOP_PAIRS=1 also matches the end of the sequence back to its start, closing
+# orbit captures that finish where they began (experimental).
+LOOP_PAIRS ?=
+# Outputs go to runs/real/<dataset>_runs/<scene>/ (RUN=dir writes elsewhere).
+# Kept: mesh/<arm>.ply, metrics/<name>.json, poses/sparse_txt + export*/ (cameras,
+# trajectory). Intermediates (depth/, work/, COLMAP database and logs) are
+# deleted after the last requested target; KEEP_INTERMEDIATE=1 keeps them.
+IS_DTU := $(findstring dtu,$(DATA))
+RUN ?= runs/real/$(if $(IS_DTU),dtu,mobilebrick)_runs/$(SCENE)
+KEEP_INTERMEDIATE ?=
+# GPU-heavy stages take turns through one lock, so parallel scenes
+# (BENCH_JOBS) overlap one scene's CPU work with another's GPU work.
+GPU_LOCK ?= /tmp/me566_gpu.lock
+GPU := flock $(GPU_LOCK)
+# Quiet recipes: one coloured stage label per command; VERBOSE=1 shows commands.
+Q := $(if $(VERBOSE),,@)
+stage = printf '\033[1;36m▶ %s\033[0m  %s\n' '$(1)' '$(notdir $@)' && mkdir -p '$(RUN)' && printf '%s\t%s\n' "$$(date +%s.%N)" '$(1)' >> '$(RUN)/timing.log'
+DEPTH_ROOT := $(RUN)/depth
+WORK := $(RUN)/work
+MESHES := $(RUN)/mesh
+METRICS := $(RUN)/metrics
+POSE := $(RUN)/poses
+MASKS ?= $(if $(wildcard $(SEQ)/sam_hq/masks/00000000.png),$(SEQ)/sam_hq/masks,$(SEQ)/masks)
+MOGE_CHECKPOINT ?=
+VGGT_CHECKPOINT_DIR ?=
+VGGT_WINDOW ?= 16
+VGGT_STEP ?= 8
+VGGT_MASK_VOTE ?= .8
+# Drop object pieces masked in fewer views than this fraction of the main piece (0: off). Removes
+# things a mask briefly covered (a chair in a few frames); neutral with complete masks.
+OBJECT_SUPPORT ?= .25
+TSDF_DEVICE ?= cuda
+# Scene surface must be seen by this many frames; fewer leaves floaters and shards.
+SCENE_MIN_VIEWS ?= 3
+TSDF_ARGS = --device $(TSDF_DEVICE) --min-views $(SCENE_MIN_VIEWS)
+# Accept `make construct path` (relative or absolute folder or video) and SCAN=path.
+SCAN_GOAL := $(if $(filter construct,$(MAKECMDGOALS)),$(firstword $(filter-out construct,$(MAKECMDGOALS))),)
+SCAN ?= $(SCAN_GOAL)
+SCAN_MAX_EDGE ?= 1200
+SCAN_FPS ?= 6
+# Object masks for a capture: by default BiRefNet masks the salient object in every frame. To
+# define the object yourself, supply SCAN_MASKS=dir (one per source image, same file stem) or
+# SCAN_MASK_COMMAND='program {frames} {output}' (any external generator writing one NNNNNNNN.png
+# per frame); SCAN_COMPLETE_MASKS=1 fills in parts they miss with BiRefNet, SCAN_REFINE_MASKS=1
+# refines their edges with SAM-HQ. SCAN_SCENE=1 skips masks and reconstructs the whole scene.
+SCAN_MASKS ?=
+SCAN_MASK_COMMAND ?=
+SCAN_COMPLETE_MASKS ?=
+SCAN_REFINE_MASKS ?=
+SCAN_SCENE ?=
+SCAN_NAME := $(notdir $(patsubst %/,%,$(SCAN)))
+SCAN_OUTPUT ?= runs/scans/$(if $(wildcard $(SCAN)/.),$(SCAN_NAME),$(basename $(SCAN_NAME)))
+CHECKPOINT_ARG := $(if $(MOGE_CHECKPOINT),--checkpoint $(MOGE_CHECKPOINT),)
+RAW := $(DEPTH_ROOT)/moge_raw
+SCENE_DEPTH := $(DEPTH_ROOT)/moge_scene
+VGGT_DEPTH := $(DEPTH_ROOT)/vggt
+# Default (hybrid): VGGT depth on the object, MoGe depth for the background.
+HYBRID_DEPTH := $(DEPTH_ROOT)/hybrid
+# Default: add DA3 depth and pick VGGT or DA3 region by region with full-resolution photometric
+# evidence (recon.depth.fusion.filter); everything downstream uses the fused depth.
+# FUSION= (empty) keeps VGGT object depth alone.
+FUSION ?= 1
+DA3_CHECKPOINT ?= depth-anything/DA3-GIANT
+# DA3 input resolution: 756 beat 504 on every development scene (p90 5-11% lower); 1008 runs out of
+# memory on a 24 GB GPU.
+DA3_RES ?= 756
+FUSION_IMAGES ?= $(DATA)/$(SCENE)/image
+DA3_DEPTH := $(DEPTH_ROOT)/da3
+FUSED_DEPTH := $(DEPTH_ROOT)/fused
+# Then a photometric plane sweep fine-tunes the fused depth; REFINE= (empty) skips it.
+REFINE ?= 1
+# Cross-view depth check: relative depth difference that counts as agreement. 1% beat 3% on the
+# development scenes (F@1mm +0.8/-0.2/+1.1/+0.1, shape p90 lower on all four); 0.5% and 0.25% were mixed.
+CONSISTENCY_TOLERANCE ?= .01
+REFINED_FUSED_DEPTH := $(DEPTH_ROOT)/fused_refined
+OBJECT_DEPTH_INPUT := $(if $(FUSION),$(if $(REFINE),$(REFINED_FUSED_DEPTH),$(FUSED_DEPTH)),$(HYBRID_DEPTH))
+CONSISTENT_DEPTH := $(DEPTH_ROOT)/consistent
+SCENE_MESH := $(WORK)/scene.ply
+OBJECT_MESH := $(WORK)/object.ply
+# The object surface comes from a confidence-weighted object TSDF (recon.surface.weighted_tsdf):
+# pixels count by VGGT-DA3 agreement and viewing angle; surface still needs 3 observing frames.
+# OBJECT_TSDF=scene extracts the object from the scene TSDF instead (the earlier default).
+OBJECT_TSDF ?= weighted
+WEIGHTED_OBJECT_MESH := $(WORK)/object_tsdf.ply
+OBJECT_SOURCE_MESH := $(if $(filter weighted,$(OBJECT_TSDF)),$(WEIGHTED_OBJECT_MESH),$(SCENE_MESH))
+FINAL_MESH := $(MESHES)/object.ply
+# Textured copy of the object mesh (photos projected onto a UV atlas) for viewing; TEXTURE= skips it.
+TEXTURE ?= 1
+TEXTURED_MESH := $(MESHES)/object.glb
+TEXTURE_IMAGES ?= $(FUSION_IMAGES)
+VGGT_CHECKPOINT_ARG := $(if $(VGGT_CHECKPOINT_DIR),--checkpoint-dir $(VGGT_CHECKPOINT_DIR),)
+# Full scenes (background included): pieces under 5% of the main surface are
+# dropped and tears up to 4 TSDF voxels filled, but not smoothed.
+# About 30-100 MB each; SCENE_MESHES= (empty) skips them.
+SCENE_MESHES ?= 1
+FINAL_SCENE := $(MESHES)/scene.ply
+scene_mesh = $(if $(SCENE_MESHES),$(1),)
+# Coloured point clouds of the default pipeline; POINT_CLOUDS= (empty) skips them.
+POINT_CLOUDS ?= 1
+POINTS := $(RUN)/points
+SCENE_POINTS := $(POINTS)/scene.ply
+OBJECT_POINTS := $(POINTS)/object.ply
+TRAJECTORY := $(POSE)/export/trajectory.csv
+LANDMARKS := $(POSE)/export_object/landmarks.ply
+BENCH_ROOT ?= runs/real/mobilebrick_sweep
+RANK_ROOT ?= runs/real/$(if $(IS_DTU),dtu,mobilebrick)_stage_ranking
+BENCH_SCENES ?= $(sort $(notdir $(patsubst %/image,%,$(wildcard $(DATA)/*/image))))
+MODEL := $(POSE)/sparse_txt
+
+# Intermediate stages: if pruned, make treats them as done rather than rebuilding.
+.SECONDARY: $(RAW)/moge_inference.json $(SCENE_DEPTH)/moge_inference.json \
+  $(VGGT_DEPTH)/vggt_inference.json $(HYBRID_DEPTH)/hybrid_depth.json \
+  $(DA3_DEPTH)/candidate.json $(FUSED_DEPTH)/hybrid_depth.json $(REFINED_FUSED_DEPTH)/hybrid_depth.json \
+  $(CONSISTENT_DEPTH)/consistency.json $(SCENE_MESH) $(OBJECT_MESH) $(WEIGHTED_OBJECT_MESH)
+
+# Runs only as part of the last goal on the command line, so a later goal in the
+# same command (e.g. `make reconstruct evaluate`) still finds shared depth.
+PRUNE_COMMAND = test -n "$(SCENE)" && test -d "$(RUN)/poses" && rm -rf "$(DEPTH_ROOT)" "$(WORK)" \
+	"$(POSE)/database.db" "$(POSE)/lightglue_raw_matches.txt" "$(POSE)/sparse" \
+	"$(POSE)/sparse_per_frame_focal" "$(POSE)/shared_focal_txt" "$(POSE)/verify_chunks" \
+	&& rm -f "$(POSE)"/*.log "$(MESHES)"/*.json "$(POINTS)"/*.json && echo 'Pruned intermediates in $(RUN)'
+PRUNE = $(if $(KEEP_INTERMEDIATE),,$(if $(filter $@,$(lastword $(MAKECMDGOALS))),@$(PRUNE_COMMAND)))
+
+.PHONY: report view_ply stage-ranking prepare-dtu evaluate-dtu setup-vggt benchmark help setup setup-masks download prepare reconstruct rebuild-object construct poses depth scene object evaluate test status refine-masks
+
+help:
+	@echo 'Inputs are RGB frames plus object masks; cameras are estimated from the images.'
+	@echo 'make setup                 Install dependencies and download model weights (network required once)'
+	@echo 'make download              Download the MobileBrick test split (network required once)'
+	@echo 'make prepare               Prepare half-resolution frames, masks and calibration for SCENE'
+	@echo 'make reconstruct           Object and full-scene meshes -> RUN/mesh/object.ply, scene.ply'
+	@echo '                           and point clouds -> RUN/points/object.ply, scene.ply'
+	@echo 'make evaluate              Score the object mesh and poses against the MobileBrick reference'
+	@echo 'make evaluate-dtu          Chamfer of the object mesh (or EVAL_MESH) against the DTU laser scan'
+	@echo 'make benchmark             Reconstruct and score every scene, with a live dashboard and summary'
+	@echo 'make stage-ranking         Rerun every scene with truth poses and/or truth depth to rank stages'
+	@echo 'make construct path        Full pipeline on your own image folder or video; BiRefNet masks the'
+	@echo '                           object unless you bring SCAN_MASKS=dir or SCAN_MASK_COMMAND=...'
+	@echo '                           (SCAN_SCENE=1: whole scene, no masks)'
+	@echo 'make report                Write docs/REPORT.md from the finished runs'
+	@echo 'make view_ply PATH=f.ply    Open a mesh or point cloud in a coloured, interactive viewer'
+	@echo 'make test                  Run first-party tests'
+	@echo 'Options: SCENE=london_bus  DATA=runs/real/dtu_dataset SEQ_ROOT=runs/real/dtu_benchmark (DTU)'
+	@echo '         RUN=dir  BENCH_ROOT=dir  KEEP_INTERMEDIATE=1  PER_FRAME_FOCAL= (one shared focal)'
+	@echo '         SCENE_MESHES= (skip full-scene meshes)  POINT_CLOUDS= (skip point clouds)  VERBOSE=1'
+	@echo '         SCENE_MIN_VIEWS=3 (frames that must see scene surface; higher = cleaner, smaller)'
+	@echo '         TSDF_DEVICE=cpu|cuda  COLMAP=/path/to/colmap  MASKS=/path/to/masks'
+	@echo '         FUSION= (skip DA3 and the photometric choice between VGGT and DA3; on by default)'
+	@echo '         REFINE= (skip the photometric plane-sweep refinement of the fused depth)'
+
+setup:
+	$(PYTHON) -m pip install -r requirements.txt
+	$(PYTHON) -c "from huggingface_hub import hf_hub_download; hf_hub_download('Ruicheng/moge-3-vitl', 'model.pt')"
+	$(PYTHON) -c "from lightglue import SuperPoint, LightGlue; SuperPoint(max_num_keypoints=4096); LightGlue(features='superpoint')"
+	$(PYTHON) -c "from recon.masks.birefnet import load_model; load_model('cpu')"
+	# DA3 pins numpy<2; install it (pinned commit) without dependencies and add only what it imports.
+	$(PYTHON) -m pip install --no-deps "depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3.git@3d835ec1a5802d64a8b8b15f817a1ab54809bfe4"
+	$(PYTHON) -m pip install addict plyfile evo "moviepy==1.0.3"
+	$(PYTHON) -c "from huggingface_hub import snapshot_download; snapshot_download('$(DA3_CHECKPOINT)')"
+
+setup-vggt:
+	$(PYTHON) -c "from huggingface_hub import snapshot_download; snapshot_download('facebook/VGGT-1B')"
+
+setup-masks:
+	$(PYTHON) -c "from huggingface_hub import hf_hub_download; hf_hub_download('lkeab/hq-sam', 'sam_hq_vit_b.pth', local_dir='runs/models/sam_hq')"
+
+# Downloading is separate so all reconstruction and evaluation stages can stay offline.
+download:
+	@test -d $(DATA)/$(SCENE)/image || $(PYTHON) -m recon.inputs.mobilebrick.download
+
+$(DATA)/$(SCENE)/image: download
+
+prepare: $(SEQ)/sequence.json
+$(SEQ)/sequence.json: $(DATA)/$(SCENE)/image
+	$(if $(IS_DTU),@echo 'DTU is prepared once with: make prepare-dtu' && false,$(PYTHON) -m recon.inputs.mobilebrick.prepare --source $(DATA) --output $(SEQ_ROOT))
+
+# DTU (NeuS/IDR release, reference scans and evaluation masks) under DTU_SOURCE.
+DTU_SOURCE ?= /media/megrad/Data_Storage1/datasets/dtu
+prepare-dtu:
+	@$(call stage,Preparing DTU)
+	$(Q)$(PYTHON) -m recon.inputs.dtu.prepare --source $(DTU_SOURCE) --data $(DTU_SOURCE)/converted --output runs/real/dtu_benchmark
+	ln -sfn $(abspath $(DTU_SOURCE)/converted) runs/real/dtu_dataset
+
+poses: $(TRAJECTORY) $(LANDMARKS)
+$(POSE)/summary.json: $(SEQ)/sequence.json
+	@$(call stage,Camera poses)
+	$(Q)$(PYTHON) -m recon.cameras.solve --sequence $(SEQ) $(INTRINSICS_ARG) --output $(POSE) --colmap $(COLMAP) --features $(FEATURES) --camera-model $(CAMERA_MODEL) --max-keypoints $(MAX_KEYPOINTS) $(if $(FEATURE_FRAMES),--feature-frames $(FEATURE_FRAMES) --scales $(FEATURE_SCALES),) $(if $(PER_FRAME_FOCAL),--per-frame-focal,) $(if $(LOOP_PAIRS),--loop,) --pairs $(PAIRS) $(if $(REFINE_PP),--refine-principal-point,) $(if $(NORMALIZE_DEPTH),--normalize-depth $(NORMALIZE_DEPTH),)
+
+$(RAW)/moge_inference.json: $(POSE)/summary.json
+	@$(call stage,MoGe depth)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.monocular.moge $(SEQ) --model $(MODEL) --output-dir $(RAW) $(CHECKPOINT_ARG)
+
+$(TRAJECTORY): $(POSE)/summary.json
+	@$(call stage,Exporting poses)
+	$(Q)$(PYTHON) -m recon.cameras.export $(MODEL) $(POSE)/export
+
+$(LANDMARKS): $(POSE)/summary.json
+	@$(call stage,Exporting poses)
+	$(Q)$(PYTHON) -m recon.cameras.export $(MODEL) $(POSE)/export_object --sequence $(SEQ)
+
+depth: $(CONSISTENT_DEPTH)/consistency.json
+$(SCENE_DEPTH)/moge_inference.json: $(POSE)/summary.json $(RAW)/moge_inference.json
+	@$(call stage,MoGe grounding (scene))
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.monocular.moge $(SEQ) --model $(MODEL) --output-dir $(SCENE_DEPTH) --anchor-region all --reuse-raw-dir $(RAW) $(CHECKPOINT_ARG)
+
+scene: $(SCENE_MESH)
+object: $(FINAL_MESH)
+$(FINAL_SCENE): $(MESHES)/%.ply: $(WORK)/%.ply
+	@$(call stage,Scene mesh cleanup)
+	$(Q)$(PYTHON) -m recon.surface.clean $< $@ --smooth-iterations 0 --min-fraction .05 --hole-size .08
+
+# VGGT multiview depth inside the mask, anchored to the same COLMAP map.
+$(VGGT_DEPTH)/vggt_inference.json: $(POSE)/summary.json
+	@$(call stage,VGGT depth)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.vggt $(SEQ) --model $(MODEL) --output-dir $(VGGT_DEPTH) --window $(VGGT_WINDOW) --step $(VGGT_STEP) $(VGGT_CHECKPOINT_ARG)
+
+$(HYBRID_DEPTH)/hybrid_depth.json: $(SCENE_DEPTH)/moge_inference.json $(VGGT_DEPTH)/vggt_inference.json
+	@$(call stage,Combining depth)
+	$(Q)$(PYTHON) -m recon.depth.combine --scene-depth-dir $(SCENE_DEPTH) --object-depth-dir $(VGGT_DEPTH) --object-depth-kind grounded --masks-dir $(MASKS) --output-dir $(HYBRID_DEPTH)
+
+$(DA3_DEPTH)/candidate.json: $(POSE)/summary.json
+	@$(call stage,DA3 depth)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.da3 $(SEQ) --colmap-model $(MODEL) --output-dir $(DA3_DEPTH) --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES)
+
+$(FUSED_DEPTH)/hybrid_depth.json: $(HYBRID_DEPTH)/hybrid_depth.json $(DA3_DEPTH)/candidate.json recon/depth/fusion/filter.py
+	@$(call stage,Photometric fusion)
+	$(Q)$(GPU) $(PYTHON) -m recon.depth.fusion.filter --model $(MODEL) --masks-dir $(MASKS) --base-depth $(HYBRID_DEPTH) --images $(FUSION_IMAGES) --candidate vggt $(VGGT_DEPTH) 0 --candidate da3 $(DA3_DEPTH) 0 --output-dir $(FUSED_DEPTH)
+
+$(REFINED_FUSED_DEPTH)/hybrid_depth.json: $(FUSED_DEPTH)/hybrid_depth.json recon/depth/fusion/refine.py
+	@$(call stage,Photometric refinement)
+	$(Q)$(GPU) $(PYTHON) -m recon.depth.fusion.refine --model $(MODEL) --masks-dir $(MASKS) --depth-dir $(FUSED_DEPTH) --images $(FUSION_IMAGES) --output-dir $(REFINED_FUSED_DEPTH)
+
+$(CONSISTENT_DEPTH)/consistency.json: $(OBJECT_DEPTH_INPUT)/hybrid_depth.json $(TRAJECTORY)
+	@$(call stage,Cross-view depth check)
+	$(Q)$(GPU) $(PYTHON) -m recon.depth.consistency --model $(MODEL) --trajectory $(TRAJECTORY) --depth-dir $(OBJECT_DEPTH_INPUT) --output-dir $(CONSISTENT_DEPTH) --tolerance $(CONSISTENCY_TOLERANCE)
+
+$(SCENE_MESH): $(CONSISTENT_DEPTH)/consistency.json $(TRAJECTORY) recon/surface/tsdf.py
+	@$(call stage,TSDF fusion)
+	$(Q)$(GPU) $(PYTHON) -m recon.surface.tsdf $(SEQ) --model $(MODEL) --trajectory $(TRAJECTORY) --depth-dir $(CONSISTENT_DEPTH) --output $@ $(TSDF_ARGS)
+
+$(WEIGHTED_OBJECT_MESH): $(CONSISTENT_DEPTH)/consistency.json $(LANDMARKS) recon/surface/weighted_tsdf.py
+	@$(call stage,Weighted object TSDF)
+	$(Q)$(GPU) $(PYTHON) -m recon.surface.weighted_tsdf $(SEQ) --model $(MODEL) --depth-dir $(CONSISTENT_DEPTH) --landmarks $(LANDMARKS) --output $@ --angle-weight $(if $(FUSION),--agreement $(VGGT_DEPTH) $(DA3_DEPTH),)
+
+$(OBJECT_MESH): $(OBJECT_SOURCE_MESH) $(LANDMARKS)
+	@$(call stage,Object extraction)
+	$(Q)$(PYTHON) -m recon.surface.object $(OBJECT_SOURCE_MESH) --bounds-cloud $(LANDMARKS) --masks-dir $(MASKS) --depth-dir $(OBJECT_DEPTH_INPUT) --trajectory $(TRAJECTORY) --model $(MODEL) --output $@ --min-ratio $(VGGT_MASK_VOTE) --min-component-support $(OBJECT_SUPPORT)
+
+$(FINAL_MESH): $(OBJECT_MESH)
+	@$(call stage,Mesh cleanup)
+	$(Q)$(PYTHON) -m recon.surface.clean $< $@ --hole-size .08
+
+$(SCENE_POINTS) $(OBJECT_POINTS) &: $(CONSISTENT_DEPTH)/consistency.json $(TRAJECTORY) $(LANDMARKS) recon/surface/points.py
+	@$(call stage,Point clouds)
+	$(Q)$(GPU) $(PYTHON) -m recon.surface.points $(SEQ) --model $(MODEL) --trajectory $(TRAJECTORY) --depth-dir $(CONSISTENT_DEPTH) --vote-depth-dir $(OBJECT_DEPTH_INPUT) --masks-dir $(MASKS) --bounds-cloud $(LANDMARKS) --scene-output $(SCENE_POINTS) --object-output $(OBJECT_POINTS) --min-ratio $(VGGT_MASK_VOTE)
+
+$(TEXTURED_MESH): $(FINAL_MESH) recon/surface/texture.py
+	@$(call stage,Texture)
+	$(Q)$(PYTHON) -m recon.surface.texture $(FINAL_MESH) --model $(MODEL) --trajectory $(TRAJECTORY) --images $(TEXTURE_IMAGES) --sequence $(SEQ) --output $@
+
+reconstruct: $(FINAL_MESH) $(if $(TEXTURE),$(TEXTURED_MESH),) $(call scene_mesh,$(FINAL_SCENE)) $(if $(POINT_CLOUDS),$(SCENE_POINTS) $(OBJECT_POINTS),)
+	@echo 'Object mesh:  $(abspath $(FINAL_MESH))'
+	$(if $(TEXTURE),@echo 'Textured:     $(abspath $(TEXTURED_MESH))',)
+	$(if $(SCENE_MESHES),@echo 'Scene mesh:   $(abspath $(FINAL_SCENE))',)
+	$(if $(POINT_CLOUDS),@echo 'Point clouds: $(abspath $(POINTS))/object.ply and scene.ply',)
+	$(PRUNE)
+
+# After changing MASKS: rebuild the mask-dependent depth and meshes (needs KEEP_INTERMEDIATE=1 runs).
+rebuild-object:
+	rm -rf $(HYBRID_DEPTH) $(FUSED_DEPTH) $(REFINED_FUSED_DEPTH) $(CONSISTENT_DEPTH)
+	rm -f $(SCENE_MESH) $(OBJECT_MESH) $(FINAL_MESH) $(FINAL_SCENE) $(SCENE_POINTS) $(OBJECT_POINTS) $(METRICS)/object.json
+	$(MAKE) reconstruct SCENE=$(SCENE) RUN=$(RUN) MASKS=$(MASKS)
+
+evaluate: $(FINAL_MESH)
+	@$(call stage,Scoring mesh)
+	$(Q)$(PYTHON) -m recon.evaluation.metrics.mesh $(FINAL_MESH) --reference $(DATA)/$(SCENE)/mesh/gt_mesh.ply --trajectory $(TRAJECTORY) --pose-dir $(DATA)/$(SCENE)/pose --output $(METRICS)/object.json
+	@$(call stage,MobileBrick official score)
+	$(Q)$(PYTHON) -m recon.evaluation.metrics.mobilebrick $(FINAL_MESH) --scene $(DATA)/$(SCENE) --trajectory $(TRAJECTORY) --output $(METRICS)/object_official.json > /dev/null
+	@$(call stage,Scoring poses)
+	$(Q)$(PYTHON) -m recon.evaluation.metrics.poses $(TRAJECTORY) $(DATA)/$(SCENE)/pose --output $(METRICS)/poses.json
+	$(Q)$(PYTHON) -m recon.evaluation.metrics.pose_auc $(TRAJECTORY) $(DATA)/$(SCENE)/pose --output $(METRICS)/pose_auc.json > /dev/null
+	@$(call stage,Reprojection check)
+	$(Q)$(PYTHON) -m recon.evaluation.metrics.reprojection $(MODEL)
+	$(PRUNE)
+
+refine-masks:
+	@test -n "$(TRACKED_MASKS)" || { echo 'Set TRACKED_MASKS=/path/to/tracked/masks'; exit 1; }
+	$(PYTHON) -m recon.masks.sam_hq $(SEQ) --input-masks $(TRACKED_MASKS) --output-masks $(SEQ)/sam_hq/masks --checkpoint runs/models/sam_hq/sam_hq_vit_b.pth
+
+# The default pipeline on every scene with supplied masks; one log per scene under
+# BENCH_ROOT. DTU (DATA=runs/real/dtu_dataset ...) is scored by chamfer.
+BENCH_JOBS ?= 2
+# Live rich dashboard; each scene's full output goes to BENCH_ROOT/<scene>.log.
+# Reconstruct every scene four times (ours, truth poses, truth depth, both) to rank stages.
+stage-ranking:
+	$(Q)$(PYTHON) -m recon.evaluation.diagnostics.stage_ranking --dataset $(if $(IS_DTU),dtu,mobilebrick) --root $(RANK_ROOT) --jobs $(BENCH_JOBS) --colmap $(COLMAP) --scenes $(BENCH_SCENES)
+
+benchmark:
+	$(Q)$(PYTHON) -m recon.evaluation.benchmark.run DATA=$(DATA) --root $(BENCH_ROOT) \
+	  --seq-root $(SEQ_ROOT) --jobs $(BENCH_JOBS) $(if $(IS_DTU),--dtu,) --scenes $(BENCH_SCENES)
+
+# DTU chamfer (mm) of EVAL_MESH against the scan's laser reference.
+EVAL_MESH ?= $(FINAL_MESH)
+evaluate-dtu: $(EVAL_MESH)
+	@$(call stage,DTU chamfer)
+	$(Q)$(PYTHON) -m recon.evaluation.metrics.dtu $(EVAL_MESH) --reference $(DATA)/$(SCENE)/reference --trajectory $(TRAJECTORY) --pose-dir $(DATA)/$(SCENE)/pose --output $(METRICS)/$(notdir $(EVAL_MESH:.ply=))_dtu.json
+	$(Q)$(PYTHON) -m recon.evaluation.metrics.pose_auc $(TRAJECTORY) $(DATA)/$(SCENE)/pose --output $(METRICS)/pose_auc.json > /dev/null
+	$(PRUNE)
+
+# Results report from the finished runs (published comparisons, latency, ablations): docs/REPORT.md.
+report:
+	$(PYTHON) -m recon.evaluation.benchmark.report
+
+# Open3D's native viewer for a mesh, point cloud or textured .glb: make view_ply PATH=file (or PLY=file).
+# A PATH= on the command line replaces the shell's search path, so the recipe restores the one
+# make was started with (captured while parsing, before recipes see the override).
+HOST_PATH := $(shell printenv PATH)
+VIEW_PLY = $(or $(PLY),$(if $(filter command line,$(origin PATH)),$(PATH),))
+view_ply:
+	@test -n "$(VIEW_PLY)" || { echo 'Use make view_ply PATH=path/to/file.ply (or PLY=...)'; exit 2; }
+	@/usr/bin/env PATH='$(HOST_PATH)' $(PYTHON) -m recon.apps.view_ply '$(VIEW_PLY)'
+
+test:
+	$(PYTHON) -m pytest -q tests
+
+status:
+	@echo 'Scene: $(SEQ)'
+	@echo 'Masks: $(MASKS)'
+	@echo 'Mesh: $(abspath $(FINAL_MESH))'
+	@test -f $(FINAL_MESH) && ls -lh $(FINAL_MESH) || true
+
+ifneq ($(SCAN_GOAL),)
+.PHONY: $(SCAN_GOAL)
+$(SCAN_GOAL):
+	@:
+endif
+
+construct:
+	@test -e "$(SCAN)" || { echo 'Use make construct path/to/images_or_video.mp4 or make construct SCAN=path'; exit 2; }
+	$(PYTHON) -m recon.apps.construct "$(SCAN)" --output "$(SCAN_OUTPUT)" --max-edge $(SCAN_MAX_EDGE) --sample-fps $(SCAN_FPS) $(if $(SCAN_MASKS),--masks "$(SCAN_MASKS)",) $(if $(SCAN_MASK_COMMAND),--mask-command '$(SCAN_MASK_COMMAND)',) $(if $(SCAN_COMPLETE_MASKS),--complete-masks,) $(if $(SCAN_REFINE_MASKS),--refine-masks,) $(if $(SCAN_SCENE),--scene,)
