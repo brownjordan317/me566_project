@@ -1,7 +1,8 @@
 """COLMAP structure from motion around externally matched features.
 
 Creates the database, installs cameras and keypoints, verifies raw matches in
-parallel, runs the incremental mapper with a progress bar, and prepares text
+parallel, runs the incremental mapper with a progress bar (or builds the model from
+given cameras, initialised_model), and prepares text
 models for per-frame focal refinement and for rescaling to working frames.
 """
 from __future__ import annotations
@@ -107,6 +108,63 @@ def run_mapper(command: list[str], log: Path, images: int, env: dict) -> None:
     progress.close()
     if process.returncode:
         raise subprocess.CalledProcessError(process.returncode, command)
+
+
+def initialised_model(database: Path, cameras: Path, scale: float, output: Path, colmap: str, env: dict,
+                      rounds: int, refine_focal: bool, log: Path) -> Path:
+    """A registered model from given cameras instead of incremental mapping.
+
+    cameras is a text model (e.g. recon.cameras.feedforward) at the working
+    resolution; scale takes it to the database's keypoint resolution. Its poses
+    and median focal length seed the database's single shared camera, the
+    verified matches are triangulated with those cameras fixed, and with rounds
+    > 0 bundle adjustment (focal refined if asked) alternates with re-triangulation
+    from scratch, as incremental mapping does. Six rounds reached COLMAP's own
+    optimum from VGGT-Omega's cameras on jeep and DTU scan37.
+    """
+    with sqlite3.connect(database) as connection:
+        camera_id, width, height = connection.execute('SELECT camera_id, width, height FROM cameras').fetchone()
+        ids = {name: image_id for image_id, name in connection.execute('SELECT image_id, name FROM images')}
+    rows = [line.split() for line in (cameras / 'cameras.txt').read_text().splitlines()
+            if line and not line.startswith('#')]
+    focal = float(np.median([float(row[4]) for row in rows])) * scale
+    poses = [line.split() for line in (cameras / 'images.txt').read_text().splitlines()
+             if line and not line.startswith('#') and len(line.split()) >= 10]
+    source = output / 'init'
+    source.mkdir(parents=True, exist_ok=True)
+    (source / 'cameras.txt').write_text(f'{camera_id} SIMPLE_PINHOLE {width} {height} {focal} {width / 2} {height / 2}\n')
+    images = []
+    for fields in poses:
+        if fields[9] in ids:
+            images += [' '.join([str(ids[fields[9]]), *fields[1:8], str(camera_id), fields[9]]), '']
+    (source / 'images.txt').write_text('\n'.join(images) + '\n')
+    (source / 'points3D.txt').write_text('')
+    with log.open('w') as stream:
+        run = lambda *args: subprocess.run([colmap, *map(str, args)], check=True, env=env, stdout=stream,
+                                           stderr=subprocess.STDOUT)
+        for index in range(max(rounds, 0) + 1):
+            triangulated = output / f'triangulated_{index}'
+            triangulated.mkdir(exist_ok=True)
+            run('point_triangulator', '--database_path', database, '--image_path', output,
+                '--input_path', source, '--output_path', triangulated)
+            if index == rounds:
+                return triangulated
+            adjusted = output / f'adjusted_{index}'
+            adjusted.mkdir(exist_ok=True)
+            run('bundle_adjuster', '--input_path', triangulated, '--output_path', adjusted,
+                '--BundleAdjustment.refine_focal_length', int(refine_focal),
+                '--BundleAdjustment.refine_principal_point', 0, '--BundleAdjustment.refine_extra_params', 0,
+                '--BundleAdjustment.max_num_iterations', 300)
+            # Next round: the adjusted cameras, without points (re-triangulated from scratch).
+            source = output / f'cameras_{index}'
+            source.mkdir(exist_ok=True)
+            run('model_converter', '--input_path', adjusted, '--output_path', source, '--output_type', 'TXT')
+            # Pose lines have 10 fields; observation lines a multiple of 3 (possibly none).
+            body = [line for line in (source / 'images.txt').read_text().splitlines()
+                    if not line.startswith('#') and len(line.split()) == 10]
+            (source / 'images.txt').write_text('\n'.join(sum(([pose, ''] for pose in body), [])) + '\n')
+            (source / 'points3D.txt').write_text('')
+    return source
 
 
 def verify_matches(database: Path, blocks: list[str], workdir: Path, colmap: str,

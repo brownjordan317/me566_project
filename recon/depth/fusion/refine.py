@@ -45,6 +45,8 @@ def main() -> None:
                    help='Required score gain over the model depth before a pixel moves')
     p.add_argument('--slanted', action=argparse.BooleanOptionalAction, default=True,
                    help='Tilt patches to the surface normal of the fused depth')
+    p.add_argument('--passes', type=int, default=1,
+                   help='Sweeps per frame, each around the previous result (the band re-centres)')
     p.add_argument('--neighbours', type=int, default=6)
     p.add_argument('--angle-band', type=float, nargs=2, metavar=('LOW', 'HIGH'), default=(10., 35.),
                    help='Prefer neighbours whose viewing direction differs by this many degrees; '
@@ -71,49 +73,57 @@ def main() -> None:
     offsets = np.linspace(-a.range, a.range, a.steps)
     centre = a.steps // 2
     penalty = a.penalty * (offsets / a.range) ** 2
+
+    def sweep(depth: np.ndarray, index: int, number: int) -> np.ndarray:
+        """One plane sweep of the frame's object pixels around their current depth."""
+        height, width = depth.shape
+        mask = (cv2.imread(str(a.masks_dir / f'{number:08d}.png'), cv2.IMREAD_GRAYSCALE) > 127) & (depth > 0)
+        grid = np.zeros_like(mask)
+        grid[::a.stride, ::a.stride] = True
+        v, u = np.nonzero(mask & grid)
+        if not len(u):
+            return depth
+        base = T(depth[v, u])
+        normals = T(camera_normals(depth, intrinsics[number])[v, u]) if a.slanted else None
+        cost = np.empty((a.steps, height, width), np.float32)
+        for k, offset in enumerate(offsets):
+            score = ncc_scores(images, index, near[index], K, R, t, base * float(np.exp(offset)),
+                               T(u), T(v), a.radius, normals=normals).cpu().numpy()
+            values = np.zeros((height, width), np.float32)
+            values[v, u] = score
+            cost[k] = pool(values, mask & grid, a.window) - penalty[k]
+        cost = np.nan_to_num(cost, nan=-np.inf)
+        best = cost.argmax(0)
+        inner = np.clip(best, 1, a.steps - 2)
+        left = np.take_along_axis(cost, (inner - 1)[None], 0)[0]
+        middle = np.take_along_axis(cost, inner[None], 0)[0]
+        right = np.take_along_axis(cost, (inner + 1)[None], 0)[0]
+        curvature = left - 2 * middle + right
+        with np.errstate(all='ignore'):
+            shift = np.where(curvature < 0, .5 * (left - right) / curvature, 0)
+        shift = np.where((best == inner) & np.isfinite(shift), np.clip(shift, -.5, .5), 0)
+        change = offsets[best] + shift * (offsets[1] - offsets[0])
+        gain = cost.max(0) - cost[centre]
+        moved = mask & np.isfinite(gain) & (gain > a.margin)
+        return np.where(moved, depth * np.exp(change), depth).astype(np.float32)
+
     a.output_dir.mkdir(parents=True, exist_ok=True)
     reports = []
     with torch.inference_mode():
         for index in bar(available, desc='Photometric refinement', unit='frame'):
             number = numbers[index]
             depth = np.load(a.depth_dir / f'{number:08d}_grounded.npy').astype(np.float32)
-            height, width = depth.shape
-            mask = (cv2.imread(str(a.masks_dir / f'{number:08d}.png'), cv2.IMREAD_GRAYSCALE) > 127) & (depth > 0)
-            grid = np.zeros_like(mask)
-            grid[::a.stride, ::a.stride] = True
-            v, u = np.nonzero(mask & grid)
-            if not len(u):
-                np.save(a.output_dir / f'{number:08d}_grounded.npy', depth)
-                continue
-            base = T(depth[v, u])
-            normals = T(camera_normals(depth, intrinsics[number])[v, u]) if a.slanted else None
-            cost = np.empty((a.steps, height, width), np.float32)
-            for k, offset in enumerate(offsets):
-                score = ncc_scores(images, index, near[index], K, R, t, base * float(np.exp(offset)),
-                                   T(u), T(v), a.radius, normals=normals).cpu().numpy()
-                values = np.zeros((height, width), np.float32)
-                values[v, u] = score
-                cost[k] = pool(values, mask & grid, a.window) - penalty[k]
-            cost = np.nan_to_num(cost, nan=-np.inf)
-            best = cost.argmax(0)
-            inner = np.clip(best, 1, a.steps - 2)
-            left = np.take_along_axis(cost, (inner - 1)[None], 0)[0]
-            middle = np.take_along_axis(cost, inner[None], 0)[0]
-            right = np.take_along_axis(cost, (inner + 1)[None], 0)[0]
-            curvature = left - 2 * middle + right
-            with np.errstate(all='ignore'):
-                shift = np.where(curvature < 0, .5 * (left - right) / curvature, 0)
-            shift = np.where((best == inner) & np.isfinite(shift), np.clip(shift, -.5, .5), 0)
-            step = offsets[1] - offsets[0]
-            change = offsets[best] + shift * step
-            gain = cost.max(0) - cost[centre]
-            moved = mask & np.isfinite(gain) & (gain > a.margin)
-            refined = np.where(moved, depth * np.exp(change), depth).astype(np.float32)
-            np.save(a.output_dir / f'{number:08d}_grounded.npy', refined)
-            reports.append({'frame': number, 'object_pixels': int(mask.sum()), 'moved': int(moved.sum()),
-                            'median_change_pct': float(np.median(np.abs(change[moved])) * 100) if moved.any() else 0.})
+            original = depth.copy()
+            for _ in range(a.passes):
+                depth = sweep(depth, index, number)
+            object_pixels = (cv2.imread(str(a.masks_dir / f'{number:08d}.png'), cv2.IMREAD_GRAYSCALE) > 127) & (original > 0)
+            changed = object_pixels & (depth != original)
+            np.save(a.output_dir / f'{number:08d}_grounded.npy', depth)
+            ratio = np.abs(np.log(np.where(changed, depth / np.where(changed, original, 1), 1)))
+            reports.append({'frame': number, 'object_pixels': int(object_pixels.sum()), 'moved': int(changed.sum()),
+                            'median_change_pct': float(np.median(ratio[changed]) * 100) if changed.any() else 0.})
     moved = sum(row['moved'] for row in reports) / max(sum(row['object_pixels'] for row in reports), 1)
-    summary = {'method': 'aggregated photometric plane sweep around fused depth', 'range': a.range,
+    summary = {'method': 'aggregated photometric plane sweep around fused depth', 'range': a.range, 'passes': a.passes,
                'steps': a.steps, 'window': a.window, 'penalty': a.penalty, 'margin': a.margin,
                'moved_fraction': moved, 'frames': len(reports), 'per_frame': reports}
     (a.output_dir / 'hybrid_depth.json').write_text(json.dumps(summary, indent=2) + '\n')

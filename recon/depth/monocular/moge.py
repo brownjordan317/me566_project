@@ -31,6 +31,8 @@ def main():
     parser.add_argument('--version', choices=('v2', 'v3'), default='v3')
     parser.add_argument('--refine-steps', type=int, default=3)
     parser.add_argument('--max-frames', type=int)
+    parser.add_argument('--images', type=Path,
+                        help='Full-resolution photos (numbered files) to feed MoGe instead of the working frames')
     parser.add_argument('--anchor-region', choices=('object', 'all'), default='object')
     parser.add_argument('--min-scale-share', type=float, default=.5,
                         help='Discard frames whose fit is mostly a constant depth')
@@ -69,9 +71,12 @@ def main():
                           allow_pickle=False)
         else:
             raw = None
-        return (cv2.imread(str(args.sequence / 'frames' / f'{number:08d}.png')),
+        frame = full[number] if args.images else args.sequence / 'frames' / f'{number:08d}.png'
+        return (cv2.imread(str(frame)),
                 cv2.imread(str(args.sequence / 'masks' / f'{number:08d}.png'),
                            cv2.IMREAD_GRAYSCALE), raw)
+
+    full = {int(path.stem): path for path in args.images.iterdir() if path.stem.isdigit()} if args.images else {}
 
     # Disk reads and writes overlap GPU inference; results are unchanged.
     reader = ThreadPoolExecutor(4)
@@ -88,9 +93,10 @@ def main():
             loads.append(reader.submit(load, frames[index + prefetch][0]))
         image, mask, raw = loads[index].result()
         loads[index] = None
-        if image is None or mask is None or image.shape[:2] != mask.shape:
+        if (image is None or mask is None
+                or abs(image.shape[1] / image.shape[0] - mask.shape[1] / mask.shape[0]) > 1e-3):
             raise ValueError(f'Missing/mismatched frame and mask {number}')
-        height, width = image.shape[:2]
+        height, width = mask.shape                         # the working frame
         focal = intrinsics[number][0, 0]
         fov_x = float(np.degrees(2 * np.arctan(width / (2 * focal))))
         if raw is None:
@@ -103,6 +109,9 @@ def main():
                 infer_options['refine_steps'] = args.refine_steps
             prediction = model.infer(tensor, **infer_options)
             raw = prediction['depth'].float().cpu().numpy()
+            if raw.shape != (height, width):
+                # Full-resolution input: the field of view is the same, so only the grid changes.
+                raw = cv2.resize(raw, (width, height), interpolation=cv2.INTER_LINEAR)
         if raw.shape != (height, width):
             raise ValueError(f'MoGe shape mismatch in frame {number}: {raw.shape}')
         anchor_mask = (mask if args.anchor_region == 'object'

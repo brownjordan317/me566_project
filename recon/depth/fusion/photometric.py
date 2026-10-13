@@ -28,7 +28,11 @@ def bilinear(image: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> torch.Ten
 
 
 class Images:
-    """Grayscale frames at full resolution, matched to frame numbers by file stem."""
+    """Grayscale frames at full resolution, matched to frame numbers by file stem.
+
+    gray is keyed by position in numbers, like the K, R, t dictionaries of the
+    callers, so frame numbers with gaps (unregistered or held-out frames) work.
+    """
 
     def __init__(self, directory: Path, numbers: list[int], working_width: int, device: str):
         files = {int(path.stem): path for path in directory.iterdir()
@@ -37,9 +41,9 @@ class Images:
         if missing:
             raise FileNotFoundError(f'No full-resolution image for frames {missing[:5]} in {directory}')
         self.gray = {}
-        for number in numbers:
+        for index, number in enumerate(numbers):
             image = cv2.imread(str(files[number]), cv2.IMREAD_GRAYSCALE)
-            self.gray[number] = torch.as_tensor(image, dtype=torch.float32, device=device)
+            self.gray[index] = torch.as_tensor(image, dtype=torch.float32, device=device)
         self.scale = next(iter(self.gray.values())).shape[1] / working_width
 
 

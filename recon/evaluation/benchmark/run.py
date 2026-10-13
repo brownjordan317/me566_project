@@ -39,13 +39,15 @@ class Scene:
         return f'{int(seconds // 60)}:{int(seconds % 60):02d}'
 
 
-def run_scene(scene: Scene, root: Path, make_vars: list[str], evaluation: list[list[str]]) -> None:
+def run_scene(scene: Scene, root: Path, make_vars: list[str], evaluation: list[list[str]],
+              scores_only: bool = False) -> None:
     scene.status, scene.start = 'running', time.monotonic()
     log = root / f'{scene.name}.log'
     env = dict(os.environ, NO_PROGRESS='1')
     base = ['make', '--no-print-directory', '-j1', f'SCENE={scene.name}',
             f'RUN={root / scene.name}', *make_vars]
-    steps = [['reconstruct'], *evaluation]
+    # Scores need only the object mesh; reconstruct also builds texture, point clouds and the scene mesh.
+    steps = evaluation if scores_only else [['reconstruct'], *evaluation]
     ok = True
     with log.open('w') as stream:
         for targets in steps:
@@ -88,6 +90,8 @@ def main() -> None:
     p.add_argument('--seq-root', type=Path, required=True)
     p.add_argument('--jobs', type=int, default=2)
     p.add_argument('--dtu', action='store_true', help='Score with DTU chamfer instead')
+    p.add_argument('--scores-only', action='store_true',
+                   help='Build only what scoring needs (no texture, point clouds or scene mesh)')
     p.add_argument('make_vars', nargs='*', help='Extra NAME=value settings passed to make')
     a = p.parse_args()
     a.root.mkdir(parents=True, exist_ok=True)
@@ -101,7 +105,7 @@ def main() -> None:
 
     def work(scene: Scene) -> None:
         masks = f'MASKS={a.seq_root / scene.name / "masks"}'
-        run_scene(scene, a.root, [*make_vars, masks], evaluation)
+        run_scene(scene, a.root, [*make_vars, masks], evaluation, a.scores_only)
         progress.advance(task)
 
     with Live(dashboard(scenes, progress), console=console, refresh_per_second=2) as live:

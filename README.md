@@ -20,7 +20,7 @@ make test
 
 `TSDF_DEVICE` defaults to `cuda`; use `TSDF_DEVICE=cpu` with a CPU-only Open3D build. The Makefile detects the local `/tmp/colmap-local/usr/bin/colmap` installation if present; otherwise set `COLMAP=/path/to/colmap`. For a different MobileBrick scene, set `SCENE=scene_name`. To use an explicit MoGe checkpoint, set `MOGE_CHECKPOINT=/path/to/model.pt`. `make status` prints the selected masks and mesh path. Completed stages are reused. When you change the mask directory, run `make rebuild-object MASKS=/path/to/masks` so the hybrid depths and meshes are regenerated. Set `RUN=/path/to/dir` to write a scene's outputs somewhere other than beside its prepared sequence.
 
-`make benchmark` reconstructs and scores every downloaded scene with the default pipeline (VGGT and DA3 object depth chosen per region by photometric evidence, MoGe depth for the background) and its supplied masks, so scenes are compared on equal terms. Each scene's outputs and log go under `runs/real/mobilebrick_sweep/` (set `BENCH_ROOT` to change this), a failed scene does not stop the sweep, and `summary_object.md` (and `.csv`; `summary_object_dtu.md` for DTU) there tabulate pose error, surface error, coverage, and open edges per scene. Set `BENCH_SCENES="jeep audi"` to run a subset. Two scenes run at once (`BENCH_JOBS=2`): GPU stages take turns through a lock file while the other scene's COLMAP mapping runs on the CPU, which cut four scenes from about 400 s to 265 s. DTU is prepared once with `make prepare-dtu` (sources under `DTU_SOURCE`, default `/media/megrad/Data_Storage1/datasets/dtu`). For DTU, add `DATA=runs/real/dtu_dataset SEQ_ROOT=runs/real/dtu_benchmark PER_FRAME_FOCAL=`; the tables then report chamfer, accuracy, and completeness. DTU's robot-arm camera has a fixed lens, so it is run with one shared focal length: per-frame focal invents drift there (scan24 chamfer 0.64 mm shared vs 1.37 mm per-frame), while it helps MobileBrick's phone captures.
+`make benchmark` reconstructs and scores every downloaded scene with the default pipeline (VGGT and DA3 object depth chosen per region by photometric evidence, MoGe depth for the background) and its supplied masks, so scenes are compared on equal terms. Each scene's outputs and log go under `runs/real/mobilebrick_sweep/` (set `BENCH_ROOT` to change this), a failed scene does not stop the sweep, and `summary_object.md` (and `.csv`; `summary_object_dtu.md` for DTU) there tabulate pose error, surface error, coverage, and open edges per scene. Set `BENCH_SCENES="jeep audi"` to run a subset, and `BENCH_SCORES_ONLY=1` to skip texture and point clouds when only the scores are wanted. Two scenes run at once (`BENCH_JOBS=2`): GPU stages take turns through a lock file while the other scene's COLMAP mapping runs on the CPU, which cut four scenes from about 400 s to 265 s. DTU is prepared once with `make prepare-dtu` (sources under `DTU_SOURCE`, default `/media/megrad/Data_Storage1/datasets/dtu`). For DTU, add `DATA=runs/real/dtu_dataset SEQ_ROOT=runs/real/dtu_benchmark PER_FRAME_FOCAL=`; the tables then report chamfer, accuracy, and completeness. DTU's robot-arm camera has a fixed lens, so it is run with one shared focal length: per-frame focal invents drift there (scan24 chamfer 0.64 mm shared vs 1.37 mm per-frame), while it helps MobileBrick's phone captures.
 
 Every table also reports **shape** metrics. The official scores place the mesh using a similarity fitted to our camera centres. From RGB alone, absolute scale cannot be known, and a 1% focal or scale offset otherwise reads as millimetres of surface error. The shape metrics refine that placement, scale included, by fitting the surface itself (ICP), then score again: *Shape median/p90* for MobileBrick and *Shape chamfer* for DTU, which uses the official protocol after refinement. *Size error* is the scale that refinement removed; it is positive when our object comes out too large. Use the official columns to compare with published results, and the shape columns to judge geometry. On the current sweeps, MobileBrick's median surface error is 1.87 mm against a shape median of 0.72 mm, and DTU's median chamfer is 0.68 mm against a shape chamfer of 0.57 mm.
 
@@ -53,7 +53,7 @@ All final PLYs use 32-bit float positions and normals plus 8-bit RGB vertex colo
 
 ## Fusing depth models (default; `FUSION=` turns it off)
 
-`make reconstruct` adds DA3-Giant depth (input resolution 756, `DA3_RES`), conditioned on our COLMAP cameras, to VGGT's. It then picks between the two region by region (`recon/depth/fusion/filter.py`). Each candidate's depth is scored by how well 9×9 full-resolution image patches match across six neighbouring views (normalized cross-correlation, best three views averaged). Scores are pooled over 17×17 working pixels, and every object pixel takes the depth of the winner. A single patch is too weak to decide; pooled over a region, the evidence holds. DA3 and the fusion add about 10–20 s per scene.
+`make reconstruct` adds DA3-Giant depth (input resolution 756, `DA3_RES`), conditioned on our COLMAP cameras, to VGGT's. All depth and camera models read the original photos, not the downsized working frames (`MODEL_IMAGES`). It then picks between the two region by region (`recon/depth/fusion/filter.py`). Each candidate's depth is scored by how well 9×9 full-resolution image patches match across six neighbouring views (normalized cross-correlation, best three views averaged). Scores are pooled over 17×17 working pixels, and every object pixel takes the depth of the winner. A single patch is too weak to decide; pooled over a region, the evidence holds. DA3 and the fusion add about 10–20 s per scene.
 
 Why it works: on the development scenes (jeep, audi, convertible, big_ben), giving the pipeline perfect depth halves the shape error, while perfect poses change nothing. That holds on all 18 MobileBrick scenes (`make stage-ranking`). VGGT and DA3 are about equally accurate but often wrong in different places. Choosing the better model per pixel with hindsight would close most of the gap; the photometric filter recovers a real part of it without hindsight:
 
@@ -185,7 +185,7 @@ This project's own code may be released openly. Its default pipeline also uses m
 
 | Component | Stage | Licence | Commercial alternative |
 |---|---|---|---|
-| COLMAP | Poses | BSD-3-Clause | — |
+| COLMAP (and pycolmap-cuda12 for PatchMatch stereo, optional) | Poses; PatchMatch depth (`PATCHMATCH`, `GEOMETRIC`) | BSD-3-Clause | — |
 | LightGlue (code and matcher weights) | Matching | Apache-2.0 | — |
 | SuperPoint weights | Keypoints | Magic Leap, non-commercial | ALIKED (BSD-3-Clause), DISK (Apache-2.0) |
 | VGGT-1B | Object depth | CC BY-NC 4.0 | DA3-Base, MapAnything (Apache-2.0), VGGT-1B-Commercial |
@@ -194,7 +194,7 @@ This project's own code may be released openly. Its default pipeline also uses m
 | BiRefNet (code and weights) | Masks for `make construct` without supplied masks; optional mask completion | MIT | — |
 | SAM-HQ | Optional mask refinement | Apache-2.0 | — |
 | Open3D, PyTorch, SciPy, rich, tqdm, halo | Fusion, utilities | MIT / BSD | — |
-| MASt3R, VGGT-Ω, DA3-Large/Giant, 2DGS (`recon/evaluation/baselines`) | Comparisons only | Non-commercial (2DGS: Gaussian-Splatting License) | — |
+| MASt3R, VGGT-Ω, DA3-Large/Giant, 2DGS, PGSR (`recon/evaluation/baselines`) | Comparisons only | Non-commercial (2DGS: Gaussian-Splatting License; PGSR: research and non-profit use only) | — |
 
 Code from non-commercial repositories is called as a separate dependency (a pip package, or a checkout under `third_party/` for comparisons), never copied into this project's files.
 
@@ -217,8 +217,8 @@ Mean chamfer over the standard 15 scans (mm, official protocol). Published metho
 | DiGS | given | 0.46 | 1.2 h |
 | Voxurf | COLMAP poses, true intrinsics | 3.48 | — |
 | Voxurf + PoRF pose refinement | COLMAP poses refined, true intrinsics | 0.85 | +2.5 h refinement |
-| **Ours** | estimated (intrinsics and poses) | **0.886** | ~4–7 min |
-| **Ours** | true intrinsics, our poses (orientation alignment) | **0.594** | ~4–7 min |
-| **Ours** | given | **0.556** | ~4–7 min |
+| **Ours** | estimated (intrinsics and poses) | **0.886** | ~2–2.5 min |
+| **Ours** | true intrinsics, our poses (orientation alignment) | **0.594** | ~2–2.5 min |
+| **Ours** | given | **0.556** | ~2–2.5 min |
 
 Our surface error after scaled ICP is about 0.51 mm in all three settings: the differences are camera placement. DTU's camera has its principal point about 30 px off centre, which self-calibration from a narrow lens can't recover; with its intrinsics known, our own poses come within 0.04 mm of the calibrated ones. Sources: 2DGS (Huang et al., SIGGRAPH 2024), QGS (Zhang et al., 2024), DiGS (2025), PoRF (Bian et al., ICLR 2024).

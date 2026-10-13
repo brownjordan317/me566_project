@@ -58,6 +58,8 @@ def main() -> None:
     p.add_argument('--window', type=int, default=16)
     p.add_argument('--step', type=int, default=8)
     p.add_argument('--max-frames', type=int)
+    p.add_argument('--images', type=Path,
+                   help='Full-resolution photos (numbered files) to feed VGGT instead of the working frames')
     args = p.parse_args()
     if args.window < 2 or args.step < 1 or args.step > args.window:
         p.error('Need window >= 2 and 1 <= step <= window')
@@ -90,13 +92,15 @@ def main() -> None:
     network.camera_head = None
     network.point_head = None
     network.track_head = None
+    # Same aspect ratio as the working frames, so unpad_depth maps the prediction back unchanged.
+    full = {int(path.stem): path for path in args.images.iterdir() if path.stem.isdigit()} if args.images else {}
     reports = []
     progress = bar(total=len(frames), desc='VGGT depth', unit='frame')
     for first in range(0, len(frames), args.step):
         begin = max(0, min(first - (args.window - args.step) // 2,
                            len(frames) - args.window))
         end = min(len(frames), begin + args.window)
-        paths = [args.sequence / 'frames' / f'{row[0]:08d}.png'
+        paths = [full[row[0]] if args.images else args.sequence / 'frames' / f'{row[0]:08d}.png'
                  for row in frames[begin:end]]
         images = load_and_preprocess_images([str(path) for path in paths],
                                             mode='pad').cuda()
@@ -127,6 +131,7 @@ def main() -> None:
     progress.close()
     summary = {'method': 'VGGT-1B multiview depth, affine COLMAP object-track grounding',
                'window': args.window, 'step': args.step,
+               'images': str(args.images) if args.images else 'working frames',
                'registered_frames': len(frames),
                'saved_frames': sum(bool(row['saved']) for row in reports),
                'checkpoint': str(checkpoint), 'reports': reports}

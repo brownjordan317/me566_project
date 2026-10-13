@@ -69,3 +69,19 @@ def test_slanted_patches_match_a_tilted_plane_better():
     depth = (normal @ np.array([0, 0, 4.])) / (rays @ normal)          # plane through (0,0,4)
     estimated = camera_normals(depth.astype(np.float32), K)[30, 40]
     assert np.dot(estimated, normal) > .99
+
+
+def test_affine_fit_maps_targets_into_prediction_space():
+    from recon.depth.multiview.da3_adapt import affine_fit
+    prediction = np.linspace(.5, 2., 50)
+    scale, shift = affine_fit(prediction, 3. * prediction + .25)
+    assert abs(scale - 3.) < 1e-9 and abs(shift - .25) < 1e-9
+
+
+def test_images_are_keyed_by_position_when_frame_numbers_have_gaps(tmp_path):
+    import cv2
+    for number, value in ((0, 10), (1, 20), (3, 30)):
+        cv2.imwrite(str(tmp_path / f'{number:08d}.png'), np.full((4, 6), value, np.uint8))
+    images = Images(tmp_path, [0, 1, 3], 6, 'cpu')
+    assert sorted(images.gray) == [0, 1, 2]
+    assert float(images.gray[2][0, 0]) == 30

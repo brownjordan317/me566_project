@@ -158,6 +158,7 @@ SOFTWARE.
 | Where | What it reproduces | Source |
 |---|---|---|
 | `recon/cameras/matching.py`: `sequential_pairs` | COLMAP's sequential pair selection with quadratic overlap | COLMAP, `src/colmap/controllers/pairing.cc` (BSD-3-Clause) |
+| `recon/depth/multiview/patchmatch.py`: `read_array`, `write_array` | COLMAP's dense depth and normal map file format | COLMAP, `scripts/python/read_write_dense.py` (BSD-3-Clause) |
 | `recon/depth/multiview/vggt.py`: `unpad_depth` | Inverse of VGGT's `load_and_preprocess_images(mode='pad')` | VGGT, `vggt/utils/load_fn.py` (VGGT License) |
 | `recon/masks/birefnet.py`: `foreground` | Inference preprocessing (1024×1024 resize, ImageNet normalisation, sigmoid of the last output) | BiRefNet model card and `inference.py`, https://github.com/ZhengPeng7/BiRefNet (MIT, Copyright (c) 2024 ZhengPeng) |
 | `recon/evaluation/metrics/pose_auc.py` | Relative pose errors and AUC (`calculate_auc_np`, `rotation_angle`, `translation_angle`) | Depth Anything 3, `src/depth_anything_3/bench/utils.py` (Apache-2.0, ByteDance), after VGGT's CO3D evaluation and PoseDiffusion |

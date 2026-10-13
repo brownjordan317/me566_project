@@ -25,6 +25,14 @@ MAX_KEYPOINTS ?= 2048
 FEATURES ?= superpoint
 # Estimated camera: simple_pinhole (one focal) or pinhole (separate x and y focal lengths).
 CAMERA_MODEL ?= simple_pinhole
+# Where cameras come from: colmap (incremental mapping, default); omega (VGGT-Omega's one-pass cameras, kept
+# fixed while COLMAP triangulates our matches); omega_ba (Omega's cameras, then CAMERA_ROUNDS rounds of bundle
+# adjustment and re-triangulation, replacing incremental mapping: same optimum as colmap, quicker on long
+# captures, every frame registered). The omega modes need `make setup-omega`.
+CAMERAS ?= colmap
+CAMERA_ROUNDS ?= 6
+FEEDFORWARD_CAMERAS = $(POSE)/feedforward
+CAMERAS_ARG = $(if $(filter omega,$(CAMERAS)),--init-cameras $(FEEDFORWARD_CAMERAS)/sparse_txt --init-rounds 0,$(if $(filter omega_ba,$(CAMERAS)),--init-cameras $(FEEDFORWARD_CAMERAS)/sparse_txt --init-rounds $(CAMERA_ROUNDS),))
 # estimate: one shared focal length from the images. dataset: the dataset's
 # per-frame intrinsics, for comparison only.
 INTRINSICS ?= estimate
@@ -48,7 +56,7 @@ LOOP_PAIRS ?=
 # trajectory). Intermediates (depth/, work/, COLMAP database and logs) are
 # deleted after the last requested target; KEEP_INTERMEDIATE=1 keeps them.
 IS_DTU := $(findstring dtu,$(DATA))
-RUN ?= runs/real/$(if $(IS_DTU),dtu,mobilebrick)_runs/$(SCENE)
+RUN ?= runs/real/$(if $(IS_DTU),dtu,mobilebrick)_runs/$(SCENE)$(if $(filter omega,$(DEPTH_MODEL)),_omega_replacement,$(if $(OMEGA),_omega_fusion,))
 KEEP_INTERMEDIATE ?=
 # GPU-heavy stages take turns through one lock, so parallel scenes
 # (BENCH_JOBS) overlap one scene's CPU work with another's GPU work.
@@ -96,6 +104,9 @@ CHECKPOINT_ARG := $(if $(MOGE_CHECKPOINT),--checkpoint $(MOGE_CHECKPOINT),)
 RAW := $(DEPTH_ROOT)/moge_raw
 SCENE_DEPTH := $(DEPTH_ROOT)/moge_scene
 VGGT_DEPTH := $(DEPTH_ROOT)/vggt
+DEPTH_MODEL ?= vggt
+PRIMARY_DEPTH = $(if $(filter omega,$(DEPTH_MODEL)),$(OMEGA_DEPTH),$(VGGT_DEPTH))
+PRIMARY_SUMMARY = $(if $(filter omega,$(DEPTH_MODEL)),$(OMEGA_DEPTH)/candidate.json,$(VGGT_DEPTH)/vggt_inference.json)
 # Default (hybrid): VGGT depth on the object, MoGe depth for the background.
 HYBRID_DEPTH := $(DEPTH_ROOT)/hybrid
 # Default: add DA3 depth and pick VGGT or DA3 region by region with full-resolution photometric
@@ -108,14 +119,54 @@ DA3_CHECKPOINT ?= depth-anything/DA3-GIANT
 DA3_RES ?= 756
 FUSION_IMAGES ?= $(DATA)/$(SCENE)/image
 DA3_DEPTH := $(DEPTH_ROOT)/da3
+# Models (MoGe, VGGT, DA3, VGGT-Omega) read the original photos, not the downsized working frames; they
+# resize internally, and their depth comes back on the working grid. MODEL_IMAGES= uses the working frames.
+MODEL_IMAGES ?= $(FUSION_IMAGES)
+MODEL_IMAGES_ARG = $(if $(MODEL_IMAGES),--images $(MODEL_IMAGES),)
+OMEGA ?=
+OMEGA_DEPTH := $(DEPTH_ROOT)/omega
+# Authors recommend the retrained 416-pixel checkpoint for benchmark comparisons.
+OMEGA_CHECKPOINT ?= vggt_omega_1b_416_reproduce.pt
+OMEGA_RES ?= 416
+OMEGA_WINDOW ?= 128
+OMEGA_STEP ?= 64
+OMEGA_RESIZE_MODE ?= balanced
+OMEGA_CANDIDATE := $(if $(and $(OMEGA),$(filter vggt,$(DEPTH_MODEL))),--candidate omega $(OMEGA_DEPTH) 0,)
+OMEGA_DEP := $(if $(and $(OMEGA),$(filter vggt,$(DEPTH_MODEL))),$(OMEGA_DEPTH)/candidate.json,)
+# PATCHMATCH=1 adds COLMAP PatchMatch stereo as a fusion candidate (needs a CUDA pycolmap: make setup-patchmatch).
+PATCHMATCH ?=
+PATCHMATCH_PYTHON ?= $(HOME)/.venvs/me566-colmap-cuda/bin/python
+PATCHMATCH_ARGS ?=
+PATCHMATCH_DEPTH := $(DEPTH_ROOT)/patchmatch
+PATCHMATCH_CANDIDATE := $(if $(PATCHMATCH),--candidate patchmatch $(PATCHMATCH_DEPTH) 0,)
+PATCHMATCH_DEP := $(if $(PATCHMATCH),$(PATCHMATCH_DEPTH)/candidate.json,)
 FUSED_DEPTH := $(DEPTH_ROOT)/fused
 # Then a photometric plane sweep fine-tunes the fused depth; REFINE= (empty) skips it.
 REFINE ?= 1
+# Plane-sweep passes per frame, each re-centred on the last (dev scenes: 3 passes +1.3 to +1.5 F@1 over 1).
+REFINE_PASSES ?= 1
 # Cross-view depth check: relative depth difference that counts as agreement. 1% beat 3% on the
 # development scenes (F@1mm +0.8/-0.2/+1.1/+0.1, shape p90 lower on all four); 0.5% and 0.25% were mixed.
 CONSISTENCY_TOLERANCE ?= .01
 REFINED_FUSED_DEPTH := $(DEPTH_ROOT)/fused_refined
-OBJECT_DEPTH_INPUT := $(if $(FUSION),$(if $(REFINE),$(REFINED_FUSED_DEPTH),$(FUSED_DEPTH)),$(HYBRID_DEPTH))
+# Scene adaptation (ADAPT=1; needs FUSION and REFINE): DA3's depth head is fine-tuned on the scene, labelled
+# by the refined fused depth where the photometric fusion is confident (recon.depth.multiview.da3_adapt);
+# DA3 then predicts again and its depth, refined REFINE_PASSES times, is the object depth.
+ADAPT ?=
+DA3_HEAD := $(DEPTH_ROOT)/da3_head.pt
+ADAPTED_DA3_DEPTH := $(DEPTH_ROOT)/da3_adapted
+ADAPTED_HYBRID_DEPTH := $(DEPTH_ROOT)/adapted_hybrid
+ADAPTED_REFINED_DEPTH := $(DEPTH_ROOT)/adapted_refined
+ADAPTING := $(and $(ADAPT),$(FUSION),$(REFINE))
+# The refinement sweeps whichever object depth there is: the fused depth, or the single model's without FUSION.
+REFINE_INPUT := $(if $(FUSION),$(FUSED_DEPTH),$(HYBRID_DEPTH))
+PRE_GEOMETRIC_DEPTH := $(if $(ADAPTING),$(ADAPTED_REFINED_DEPTH),$(if $(REFINE),$(REFINED_FUSED_DEPTH),$(REFINE_INPUT)))
+# GEOMETRIC=1: COLMAP PatchMatch's geometric-consistency pass, seeded with that depth (make setup-patchmatch).
+GEOMETRIC ?=
+GEOMETRIC_DEPTH := $(DEPTH_ROOT)/geometric
+GEOMETRIC_ARGS ?=
+OBJECT_DEPTH_INPUT := $(if $(GEOMETRIC),$(GEOMETRIC_DEPTH),$(PRE_GEOMETRIC_DEPTH))
+AGREEMENT_DEPTH := $(if $(ADAPTING),$(ADAPTED_DA3_DEPTH),$(DA3_DEPTH))
 CONSISTENT_DEPTH := $(DEPTH_ROOT)/consistent
 SCENE_MESH := $(WORK)/scene.ply
 OBJECT_MESH := $(WORK)/object.ply
@@ -123,6 +174,8 @@ OBJECT_MESH := $(WORK)/object.ply
 # pixels count by VGGT-DA3 agreement and viewing angle; surface still needs 3 observing frames.
 # OBJECT_TSDF=scene extracts the object from the scene TSDF instead (the earlier default).
 OBJECT_TSDF ?= weighted
+# Extra recon.surface.weighted_tsdf options, e.g. OBJECT_TSDF_ARGS='--voxel .01 --truncation .03'.
+OBJECT_TSDF_ARGS ?=
 WEIGHTED_OBJECT_MESH := $(WORK)/object_tsdf.ply
 OBJECT_SOURCE_MESH := $(if $(filter weighted,$(OBJECT_TSDF)),$(WEIGHTED_OBJECT_MESH),$(SCENE_MESH))
 FINAL_MESH := $(MESHES)/object.ply
@@ -144,15 +197,16 @@ SCENE_POINTS := $(POINTS)/scene.ply
 OBJECT_POINTS := $(POINTS)/object.ply
 TRAJECTORY := $(POSE)/export/trajectory.csv
 LANDMARKS := $(POSE)/export_object/landmarks.ply
-BENCH_ROOT ?= runs/real/mobilebrick_sweep
+BENCH_ROOT ?= runs/real/mobilebrick_sweep$(if $(filter omega,$(DEPTH_MODEL)),_omega_replacement,$(if $(OMEGA),_omega_fusion,))
 RANK_ROOT ?= runs/real/$(if $(IS_DTU),dtu,mobilebrick)_stage_ranking
 BENCH_SCENES ?= $(sort $(notdir $(patsubst %/image,%,$(wildcard $(DATA)/*/image))))
 MODEL := $(POSE)/sparse_txt
 
 # Intermediate stages: if pruned, make treats them as done rather than rebuilding.
 .SECONDARY: $(RAW)/moge_inference.json $(SCENE_DEPTH)/moge_inference.json \
-  $(VGGT_DEPTH)/vggt_inference.json $(HYBRID_DEPTH)/hybrid_depth.json \
-  $(DA3_DEPTH)/candidate.json $(FUSED_DEPTH)/hybrid_depth.json $(REFINED_FUSED_DEPTH)/hybrid_depth.json \
+  $(VGGT_DEPTH)/vggt_inference.json $(OMEGA_DEPTH)/candidate.json $(HYBRID_DEPTH)/hybrid_depth.json \
+  $(DA3_DEPTH)/candidate.json $(OMEGA_DEPTH)/candidate.json $(PATCHMATCH_DEPTH)/candidate.json $(GEOMETRIC_DEPTH)/hybrid_depth.json $(FUSED_DEPTH)/hybrid_depth.json $(REFINED_FUSED_DEPTH)/hybrid_depth.json \
+  $(DA3_HEAD) $(ADAPTED_DA3_DEPTH)/candidate.json $(ADAPTED_HYBRID_DEPTH)/hybrid_depth.json $(ADAPTED_REFINED_DEPTH)/hybrid_depth.json \
   $(CONSISTENT_DEPTH)/consistency.json $(SCENE_MESH) $(OBJECT_MESH) $(WEIGHTED_OBJECT_MESH)
 
 # Runs only as part of the last goal on the command line, so a later goal in the
@@ -163,7 +217,7 @@ PRUNE_COMMAND = test -n "$(SCENE)" && test -d "$(RUN)/poses" && rm -rf "$(DEPTH_
 	&& rm -f "$(POSE)"/*.log "$(MESHES)"/*.json "$(POINTS)"/*.json && echo 'Pruned intermediates in $(RUN)'
 PRUNE = $(if $(KEEP_INTERMEDIATE),,$(if $(filter $@,$(lastword $(MAKECMDGOALS))),@$(PRUNE_COMMAND)))
 
-.PHONY: report view_ply stage-ranking prepare-dtu evaluate-dtu setup-vggt benchmark help setup setup-masks download prepare reconstruct rebuild-object construct poses depth scene object evaluate test status refine-masks
+.PHONY: report view_ply stage-ranking prepare-dtu evaluate-dtu setup-vggt benchmark help setup setup-masks download prepare reconstruct rebuild-object construct poses depth scene object evaluate test status refine-masks setup-omega setup-patchmatch
 
 help:
 	@echo 'Inputs are RGB frames plus object masks; cameras are estimated from the images.'
@@ -171,6 +225,10 @@ help:
 	@echo 'make download              Download the MobileBrick test split (network required once)'
 	@echo 'make prepare               Prepare half-resolution frames, masks and calibration for SCENE'
 	@echo 'make reconstruct           Object and full-scene meshes -> RUN/mesh/object.ply, scene.ply'
+	@echo '                           DEPTH_MODEL=omega replaces VGGT with VGGT-Omega'
+	@echo '                           OMEGA=1 adds VGGT-Omega as a third fusion candidate'
+	@echo '                           PATCHMATCH=1 adds COLMAP PatchMatch stereo as a fusion candidate'
+	@echo '                           GEOMETRIC=1 runs PatchMatch geometric consistency seeded with the refined depth'
 	@echo '                           and point clouds -> RUN/points/object.ply, scene.ply'
 	@echo 'make evaluate              Score the object mesh and poses against the MobileBrick reference'
 	@echo 'make evaluate-dtu          Chamfer of the object mesh (or EVAL_MESH) against the DTU laser scan'
@@ -188,7 +246,8 @@ help:
 	@echo '         SCENE_MIN_VIEWS=3 (frames that must see scene surface; higher = cleaner, smaller)'
 	@echo '         TSDF_DEVICE=cpu|cuda  COLMAP=/path/to/colmap  MASKS=/path/to/masks'
 	@echo '         FUSION= (skip DA3 and the photometric choice between VGGT and DA3; on by default)'
-	@echo '         REFINE= (skip the photometric plane-sweep refinement of the fused depth)'
+	@echo '         REFINE= (skip the photometric plane-sweep refinement of the object depth)'
+	@echo '         ADAPT=1 (fine-tune DA3 on the scene from the fused evidence; experimental)'
 
 setup:
 	$(PYTHON) -m pip install -r requirements.txt
@@ -202,6 +261,15 @@ setup:
 
 setup-vggt:
 	$(PYTHON) -c "from huggingface_hub import snapshot_download; snapshot_download('facebook/VGGT-1B')"
+
+# VGGT-Omega (FAIR Noncommercial Research License; gated weights: log in with an approved Hugging Face account).
+setup-omega:
+	$(PYTHON) -m pip install --no-deps "vggt_omega @ git+https://github.com/facebookresearch/vggt-omega.git@48b23c8ce72c9a8fcf987f0d7f43d8e4870759f6"
+	$(PYTHON) -c "from huggingface_hub import hf_hub_download; [hf_hub_download('facebook/VGGT-Omega', f) for f in ('vggt_omega_1b_416_reproduce.pt', 'vggt_omega_1b_512.pt')]"
+
+setup-patchmatch:
+	python3 -m venv $(HOME)/.venvs/me566-colmap-cuda
+	$(HOME)/.venvs/me566-colmap-cuda/bin/pip install pycolmap-cuda12==4.2.1 numpy==2.5.4 opencv-python-headless==5.0.0.93
 
 setup-masks:
 	$(PYTHON) -c "from huggingface_hub import hf_hub_download; hf_hub_download('lkeab/hq-sam', 'sam_hq_vit_b.pth', local_dir='runs/models/sam_hq')"
@@ -224,13 +292,17 @@ prepare-dtu:
 	ln -sfn $(abspath $(DTU_SOURCE)/converted) runs/real/dtu_dataset
 
 poses: $(TRAJECTORY) $(LANDMARKS)
-$(POSE)/summary.json: $(SEQ)/sequence.json
+$(FEEDFORWARD_CAMERAS)/summary.json: $(SEQ)/sequence.json
+	@$(call stage,Feed-forward cameras)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.cameras.feedforward $(SEQ) $(MODEL_IMAGES_ARG) --output $(FEEDFORWARD_CAMERAS)
+
+$(POSE)/summary.json: $(SEQ)/sequence.json $(if $(filter colmap,$(CAMERAS)),,$(FEEDFORWARD_CAMERAS)/summary.json)
 	@$(call stage,Camera poses)
-	$(Q)$(PYTHON) -m recon.cameras.solve --sequence $(SEQ) $(INTRINSICS_ARG) --output $(POSE) --colmap $(COLMAP) --features $(FEATURES) --camera-model $(CAMERA_MODEL) --max-keypoints $(MAX_KEYPOINTS) $(if $(FEATURE_FRAMES),--feature-frames $(FEATURE_FRAMES) --scales $(FEATURE_SCALES),) $(if $(PER_FRAME_FOCAL),--per-frame-focal,) $(if $(LOOP_PAIRS),--loop,) --pairs $(PAIRS) $(if $(REFINE_PP),--refine-principal-point,) $(if $(NORMALIZE_DEPTH),--normalize-depth $(NORMALIZE_DEPTH),)
+	$(Q)$(PYTHON) -m recon.cameras.solve --gpu-lock $(GPU_LOCK) $(CAMERAS_ARG) --sequence $(SEQ) $(INTRINSICS_ARG) --output $(POSE) --colmap $(COLMAP) --features $(FEATURES) --camera-model $(CAMERA_MODEL) --max-keypoints $(MAX_KEYPOINTS) $(if $(FEATURE_FRAMES),--feature-frames $(FEATURE_FRAMES) --scales $(FEATURE_SCALES),) $(if $(PER_FRAME_FOCAL),--per-frame-focal,) $(if $(LOOP_PAIRS),--loop,) --pairs $(PAIRS) $(if $(REFINE_PP),--refine-principal-point,) $(if $(NORMALIZE_DEPTH),--normalize-depth $(NORMALIZE_DEPTH),)
 
 $(RAW)/moge_inference.json: $(POSE)/summary.json
 	@$(call stage,MoGe depth)
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.monocular.moge $(SEQ) --model $(MODEL) --output-dir $(RAW) $(CHECKPOINT_ARG)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.monocular.moge $(SEQ) --model $(MODEL) --output-dir $(RAW) $(MODEL_IMAGES_ARG) $(CHECKPOINT_ARG)
 
 $(TRAJECTORY): $(POSE)/summary.json
 	@$(call stage,Exporting poses)
@@ -243,7 +315,7 @@ $(LANDMARKS): $(POSE)/summary.json
 depth: $(CONSISTENT_DEPTH)/consistency.json
 $(SCENE_DEPTH)/moge_inference.json: $(POSE)/summary.json $(RAW)/moge_inference.json
 	@$(call stage,MoGe grounding (scene))
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.monocular.moge $(SEQ) --model $(MODEL) --output-dir $(SCENE_DEPTH) --anchor-region all --reuse-raw-dir $(RAW) $(CHECKPOINT_ARG)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.monocular.moge $(SEQ) --model $(MODEL) --output-dir $(SCENE_DEPTH) $(MODEL_IMAGES_ARG) --anchor-region all --reuse-raw-dir $(RAW) $(CHECKPOINT_ARG)
 
 scene: $(SCENE_MESH)
 object: $(FINAL_MESH)
@@ -254,23 +326,51 @@ $(FINAL_SCENE): $(MESHES)/%.ply: $(WORK)/%.ply
 # VGGT multiview depth inside the mask, anchored to the same COLMAP map.
 $(VGGT_DEPTH)/vggt_inference.json: $(POSE)/summary.json
 	@$(call stage,VGGT depth)
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.vggt $(SEQ) --model $(MODEL) --output-dir $(VGGT_DEPTH) --window $(VGGT_WINDOW) --step $(VGGT_STEP) $(VGGT_CHECKPOINT_ARG)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.vggt $(SEQ) --model $(MODEL) $(MODEL_IMAGES_ARG) --output-dir $(VGGT_DEPTH) --window $(VGGT_WINDOW) --step $(VGGT_STEP) $(VGGT_CHECKPOINT_ARG)
 
-$(HYBRID_DEPTH)/hybrid_depth.json: $(SCENE_DEPTH)/moge_inference.json $(VGGT_DEPTH)/vggt_inference.json
+$(HYBRID_DEPTH)/hybrid_depth.json: $(SCENE_DEPTH)/moge_inference.json $(PRIMARY_SUMMARY)
 	@$(call stage,Combining depth)
-	$(Q)$(PYTHON) -m recon.depth.combine --scene-depth-dir $(SCENE_DEPTH) --object-depth-dir $(VGGT_DEPTH) --object-depth-kind grounded --masks-dir $(MASKS) --output-dir $(HYBRID_DEPTH)
+	$(Q)$(PYTHON) -m recon.depth.combine --scene-depth-dir $(SCENE_DEPTH) --object-depth-dir $(PRIMARY_DEPTH) --object-depth-kind grounded --masks-dir $(MASKS) --output-dir $(HYBRID_DEPTH)
 
 $(DA3_DEPTH)/candidate.json: $(POSE)/summary.json
 	@$(call stage,DA3 depth)
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.da3 $(SEQ) --colmap-model $(MODEL) --output-dir $(DA3_DEPTH) --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.da3 $(SEQ) --colmap-model $(MODEL) --output-dir $(DA3_DEPTH) --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES) $(MODEL_IMAGES_ARG)
 
-$(FUSED_DEPTH)/hybrid_depth.json: $(HYBRID_DEPTH)/hybrid_depth.json $(DA3_DEPTH)/candidate.json recon/depth/fusion/filter.py
+$(OMEGA_DEPTH)/candidate.json: $(POSE)/summary.json recon/depth/multiview/omega.py
+	@$(call stage,VGGT-Omega depth)
+	$(Q)$(GPU) $(PYTHON) -m recon.depth.multiview.omega $(SEQ) --colmap-model $(MODEL) $(MODEL_IMAGES_ARG) --masks-dir $(MASKS) --output-dir $(OMEGA_DEPTH) --checkpoint $(OMEGA_CHECKPOINT) --resolution $(OMEGA_RES) --resize-mode $(OMEGA_RESIZE_MODE) --window $(OMEGA_WINDOW) --step $(OMEGA_STEP)
+
+$(PATCHMATCH_DEPTH)/candidate.json: $(POSE)/summary.json recon/depth/multiview/patchmatch.py
+	@$(call stage,PatchMatch depth)
+	$(Q)$(GPU) env -u LD_LIBRARY_PATH $(PATCHMATCH_PYTHON) -m recon.depth.multiview.patchmatch $(SEQ) --colmap-model $(MODEL) --output-dir $(PATCHMATCH_DEPTH) $(PATCHMATCH_ARGS)
+
+$(FUSED_DEPTH)/hybrid_depth.json: $(HYBRID_DEPTH)/hybrid_depth.json $(DA3_DEPTH)/candidate.json $(OMEGA_DEP) $(PATCHMATCH_DEP) recon/depth/fusion/filter.py
 	@$(call stage,Photometric fusion)
-	$(Q)$(GPU) $(PYTHON) -m recon.depth.fusion.filter --model $(MODEL) --masks-dir $(MASKS) --base-depth $(HYBRID_DEPTH) --images $(FUSION_IMAGES) --candidate vggt $(VGGT_DEPTH) 0 --candidate da3 $(DA3_DEPTH) 0 --output-dir $(FUSED_DEPTH)
+	$(Q)$(GPU) $(PYTHON) -m recon.depth.fusion.filter --model $(MODEL) --masks-dir $(MASKS) --base-depth $(HYBRID_DEPTH) --images $(FUSION_IMAGES) --candidate $(DEPTH_MODEL) $(PRIMARY_DEPTH) 0 --candidate da3 $(DA3_DEPTH) 0 $(OMEGA_CANDIDATE) $(PATCHMATCH_CANDIDATE) --output-dir $(FUSED_DEPTH)
 
-$(REFINED_FUSED_DEPTH)/hybrid_depth.json: $(FUSED_DEPTH)/hybrid_depth.json recon/depth/fusion/refine.py
+$(REFINED_FUSED_DEPTH)/hybrid_depth.json: $(REFINE_INPUT)/hybrid_depth.json recon/depth/fusion/refine.py
 	@$(call stage,Photometric refinement)
-	$(Q)$(GPU) $(PYTHON) -m recon.depth.fusion.refine --model $(MODEL) --masks-dir $(MASKS) --depth-dir $(FUSED_DEPTH) --images $(FUSION_IMAGES) --output-dir $(REFINED_FUSED_DEPTH)
+	$(Q)$(GPU) $(PYTHON) -m recon.depth.fusion.refine --model $(MODEL) --masks-dir $(MASKS) --depth-dir $(REFINE_INPUT) --images $(FUSION_IMAGES) --output-dir $(REFINED_FUSED_DEPTH) --passes $(REFINE_PASSES)
+
+$(GEOMETRIC_DEPTH)/hybrid_depth.json: $(PRE_GEOMETRIC_DEPTH)/hybrid_depth.json recon/depth/multiview/patchmatch.py
+	@$(call stage,PatchMatch geometric refinement)
+	$(Q)$(GPU) env -u LD_LIBRARY_PATH $(PATCHMATCH_PYTHON) -m recon.depth.multiview.patchmatch $(SEQ) --colmap-model $(MODEL) --seed-dir $(PRE_GEOMETRIC_DEPTH) --output-dir $(GEOMETRIC_DEPTH) $(GEOMETRIC_ARGS)
+
+$(DA3_HEAD): $(REFINED_FUSED_DEPTH)/hybrid_depth.json recon/depth/multiview/da3_adapt.py
+	@$(call stage,DA3 scene adaptation)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.da3_adapt $(SEQ) --colmap-model $(MODEL) --target-dir $(REFINED_FUSED_DEPTH) --confidence-dir $(FUSED_DEPTH) --output $@ --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES)
+
+$(ADAPTED_DA3_DEPTH)/candidate.json: $(DA3_HEAD)
+	@$(call stage,DA3 depth (adapted))
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.da3 $(SEQ) --colmap-model $(MODEL) --output-dir $(ADAPTED_DA3_DEPTH) --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES) $(MODEL_IMAGES_ARG) --head-weights $(DA3_HEAD)
+
+$(ADAPTED_HYBRID_DEPTH)/hybrid_depth.json: $(ADAPTED_DA3_DEPTH)/candidate.json
+	@$(call stage,Combining depth (adapted))
+	$(Q)$(PYTHON) -m recon.depth.combine --scene-depth-dir $(SCENE_DEPTH) --object-depth-dir $(ADAPTED_DA3_DEPTH) --object-depth-kind grounded --masks-dir $(MASKS) --output-dir $(ADAPTED_HYBRID_DEPTH)
+
+$(ADAPTED_REFINED_DEPTH)/hybrid_depth.json: $(ADAPTED_HYBRID_DEPTH)/hybrid_depth.json recon/depth/fusion/refine.py
+	@$(call stage,Photometric refinement (adapted))
+	$(Q)$(GPU) $(PYTHON) -m recon.depth.fusion.refine --model $(MODEL) --masks-dir $(MASKS) --depth-dir $(ADAPTED_HYBRID_DEPTH) --images $(FUSION_IMAGES) --output-dir $(ADAPTED_REFINED_DEPTH) --passes $(REFINE_PASSES)
 
 $(CONSISTENT_DEPTH)/consistency.json: $(OBJECT_DEPTH_INPUT)/hybrid_depth.json $(TRAJECTORY)
 	@$(call stage,Cross-view depth check)
@@ -282,7 +382,7 @@ $(SCENE_MESH): $(CONSISTENT_DEPTH)/consistency.json $(TRAJECTORY) recon/surface/
 
 $(WEIGHTED_OBJECT_MESH): $(CONSISTENT_DEPTH)/consistency.json $(LANDMARKS) recon/surface/weighted_tsdf.py
 	@$(call stage,Weighted object TSDF)
-	$(Q)$(GPU) $(PYTHON) -m recon.surface.weighted_tsdf $(SEQ) --model $(MODEL) --depth-dir $(CONSISTENT_DEPTH) --landmarks $(LANDMARKS) --output $@ --angle-weight $(if $(FUSION),--agreement $(VGGT_DEPTH) $(DA3_DEPTH),)
+	$(Q)$(GPU) $(PYTHON) -m recon.surface.weighted_tsdf $(SEQ) --model $(MODEL) --depth-dir $(CONSISTENT_DEPTH) --landmarks $(LANDMARKS) --output $@ --angle-weight $(if $(FUSION),--agreement $(PRIMARY_DEPTH) $(AGREEMENT_DEPTH),) $(OBJECT_TSDF_ARGS)
 
 $(OBJECT_MESH): $(OBJECT_SOURCE_MESH) $(LANDMARKS)
 	@$(call stage,Object extraction)
@@ -309,7 +409,7 @@ reconstruct: $(FINAL_MESH) $(if $(TEXTURE),$(TEXTURED_MESH),) $(call scene_mesh,
 
 # After changing MASKS: rebuild the mask-dependent depth and meshes (needs KEEP_INTERMEDIATE=1 runs).
 rebuild-object:
-	rm -rf $(HYBRID_DEPTH) $(FUSED_DEPTH) $(REFINED_FUSED_DEPTH) $(CONSISTENT_DEPTH)
+	rm -rf $(HYBRID_DEPTH) $(FUSED_DEPTH) $(REFINED_FUSED_DEPTH) $(CONSISTENT_DEPTH) $(DA3_HEAD) $(ADAPTED_DA3_DEPTH) $(ADAPTED_HYBRID_DEPTH) $(ADAPTED_REFINED_DEPTH) $(GEOMETRIC_DEPTH)
 	rm -f $(SCENE_MESH) $(OBJECT_MESH) $(FINAL_MESH) $(FINAL_SCENE) $(SCENE_POINTS) $(OBJECT_POINTS) $(METRICS)/object.json
 	$(MAKE) reconstruct SCENE=$(SCENE) RUN=$(RUN) MASKS=$(MASKS)
 
@@ -332,14 +432,16 @@ refine-masks:
 # The default pipeline on every scene with supplied masks; one log per scene under
 # BENCH_ROOT. DTU (DATA=runs/real/dtu_dataset ...) is scored by chamfer.
 BENCH_JOBS ?= 2
+# BENCH_SCORES_ONLY=1 builds only what scoring needs (skips texture, point clouds and the scene mesh).
+BENCH_SCORES_ONLY ?=
 # Live rich dashboard; each scene's full output goes to BENCH_ROOT/<scene>.log.
 # Reconstruct every scene four times (ours, truth poses, truth depth, both) to rank stages.
 stage-ranking:
 	$(Q)$(PYTHON) -m recon.evaluation.diagnostics.stage_ranking --dataset $(if $(IS_DTU),dtu,mobilebrick) --root $(RANK_ROOT) --jobs $(BENCH_JOBS) --colmap $(COLMAP) --scenes $(BENCH_SCENES)
 
 benchmark:
-	$(Q)$(PYTHON) -m recon.evaluation.benchmark.run DATA=$(DATA) --root $(BENCH_ROOT) \
-	  --seq-root $(SEQ_ROOT) --jobs $(BENCH_JOBS) $(if $(IS_DTU),--dtu,) --scenes $(BENCH_SCENES)
+	$(Q)$(PYTHON) -m recon.evaluation.benchmark.run DATA=$(DATA) DEPTH_MODEL=$(DEPTH_MODEL) $(if $(OMEGA),OMEGA=1,) OMEGA_CHECKPOINT=$(OMEGA_CHECKPOINT) OMEGA_RES=$(OMEGA_RES) OMEGA_WINDOW=$(OMEGA_WINDOW) OMEGA_STEP=$(OMEGA_STEP) OMEGA_RESIZE_MODE=$(OMEGA_RESIZE_MODE) --root $(BENCH_ROOT) \
+	  --seq-root $(SEQ_ROOT) --jobs $(BENCH_JOBS) $(if $(IS_DTU),--dtu,) $(if $(BENCH_SCORES_ONLY),--scores-only,) --scenes $(BENCH_SCENES)
 
 # DTU chamfer (mm) of EVAL_MESH against the scan's laser reference.
 EVAL_MESH ?= $(FINAL_MESH)

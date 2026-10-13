@@ -7,7 +7,10 @@ Apache-2.0) predicts consistent depth for many views at once and can take known
 camera poses and intrinsics, returning depth at their scale. Frames run in
 overlapping windows (like the VGGT stage), each with our cameras supplied; the
 depth is resized back to the working frames and grounded to the object's sparse
-points like every other candidate. Weights: DA3-Giant and DA3-Large are
+points like every other candidate. --images gives DA3 the full-resolution photos
+(with our intrinsics scaled to them) instead of the working frames: DA3 still
+resizes to --process-res, but from the original pixels (colosseum median error
+3.91 -> 3.22 mm, big_ben 2.96 -> 2.77, jeep 1.21 -> 1.19). Weights: DA3-Giant and DA3-Large are
 CC BY-NC 4.0, DA3-Base Apache-2.0.
 """
 from __future__ import annotations
@@ -45,6 +48,10 @@ def main() -> None:
     p.add_argument('--process-res', type=int, default=504)
     p.add_argument('--no-poses', action='store_true', help='Let DA3 estimate cameras itself')
     p.add_argument('--max-relative-error', type=float, default=.03)
+    p.add_argument('--head-weights', type=Path,
+                   help='Depth-head weights adapted to this scene (recon.depth.multiview.da3_adapt)')
+    p.add_argument('--images', type=Path,
+                   help='Full-resolution photos (numbered files) to feed DA3 instead of the working frames')
     p.add_argument('--raw', action='store_true',
                    help='Save DA3 depth as predicted at our cameras\' scale, without the anchor fit')
     a = p.parse_args()
@@ -53,13 +60,21 @@ def main() -> None:
     points = point_table(points)
     with spinner(f'Loading {a.checkpoint}'), contextlib.redirect_stdout(io.StringIO()):
         model = DepthAnything3.from_pretrained(a.checkpoint).to('cuda').eval()
-    images = [cv2.cvtColor(cv2.imread(str(a.sequence / 'frames' / f'{number:08d}.png')), cv2.COLOR_BGR2RGB)
-              for number, *_ in frames]
-    height, width = images[0].shape[:2]
+    if a.head_weights is not None:
+        model.model.head.load_state_dict(torch.load(a.head_weights, map_location='cuda'))
+    height, width = cv2.imread(str(a.sequence / 'frames' / f'{frames[0][0]:08d}.png')).shape[:2]
+    if a.images is not None:
+        files = {int(path.stem): path for path in a.images.iterdir() if path.stem.isdigit()}
+        paths = [files[number] for number, *_ in frames]
+    else:
+        paths = [a.sequence / 'frames' / f'{number:08d}.png' for number, *_ in frames]
+    images = [cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB) for path in paths]
+    scale = images[0].shape[1] / width                     # input pixels per working pixel
     extrinsics = np.tile(np.eye(4, dtype=np.float32), (len(frames), 1, 1))   # world-to-camera, 4x4
     for i, (_, rotation, translation, _) in enumerate(frames):
         extrinsics[i, :3, :3], extrinsics[i, :3, 3] = rotation, translation
     matrices = np.stack([intrinsics[number] for number, *_ in frames]).astype(np.float32)
+    matrices[:, :2] *= scale
     sums = np.zeros((len(frames), height, width), np.float32)
     counts = np.zeros(len(frames), np.int32)
     with torch.inference_mode():
@@ -93,7 +108,8 @@ def main() -> None:
             np.save(a.output_dir / f'{number:08d}_grounded.npy', grounded)
         reports.append({'frame': number, 'rejected': rejected, **report})
     kept = sum(not row['rejected'] for row in reports)
-    summary = {'model': a.checkpoint, 'poses_given': not a.no_poses, 'window': a.window, 'step': a.step,
+    summary = {'model': a.checkpoint, 'images': str(a.images) if a.images else 'working frames', 'head_weights': str(a.head_weights) if a.head_weights else None,
+               'poses_given': not a.no_poses, 'window': a.window, 'step': a.step,
                'frames': len(reports), 'kept': kept,
                'median_scale': float(np.median([row['scale'] for row in reports if 'scale' in row])),
                'per_frame': reports}

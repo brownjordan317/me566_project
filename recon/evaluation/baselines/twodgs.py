@@ -11,7 +11,10 @@ points) from an existing run. So the comparison isolates surface reconstruction.
 
 Steps, following the 2DGS paper's DTU recipe (scripts/dtu_eval.py):
 - the model is moved and scaled so the object landmarks fit a unit sphere (the
-  normalisation its DTU data uses), and written as images/ + sparse/0;
+  normalisation its DTU data uses), and written as images/ + sparse/0; 2DGS ignores
+  the principal point, so each image is shifted to centre it and cropped (with the
+  dataset's DTU cameras it is about 12 px off at 800 px; ignoring it put the surface
+  about 3 mm off on scan24);
 - train.py: 30k iterations, --depth_ratio 1.0 --lambda_dist 1000, full working resolution;
 - render.py: TSDF mesh with voxel 0.004, truncation 0.016, its largest cluster kept
   (fuse_post.ply); the depth cut-off is set from the cameras' distance to the object;
@@ -53,19 +56,35 @@ def normalisation(landmarks: Path) -> tuple[np.ndarray, float]:
     return center, float(np.quantile(np.linalg.norm(points - center, axis=1), .99))
 
 
-def write_workspace(source: Path, sequence: Path, workspace: Path) -> tuple[np.ndarray, float, float]:
-    """images/ and a normalised sparse/0 for 2DGS; returns centre, radius and depth cut-off."""
+def write_workspace(source: Path, sequence: Path, workspace: Path,
+                    init_points: list[Path] = (), max_points: int = 300_000) -> tuple[np.ndarray, float, float]:
+    """images/ and a normalised sparse/0 for 2DGS; returns centre, radius and depth cut-off.
+
+    With init_points (our coloured point clouds), they replace the sparse SfM points as the
+    Gaussians' starting positions: a warm start from our reconstruction."""
     model = source / 'poses/sparse_txt'
     center, radius = normalisation(source / 'poses/export_object/landmarks.ply')
     (workspace / 'sparse/0').mkdir(parents=True, exist_ok=True)
     (workspace / 'images').mkdir(exist_ok=True)
-    cameras = []
-    for line in (model / 'cameras.txt').read_text().splitlines():           # 2DGS reads PINHOLE only
+    # 2DGS reads PINHOLE only and, like 3DGS, ignores the principal point (it assumes the image centre).
+    # (COLMAP convention: the centre is (w / 2, h / 2).) So every image is shifted to put its principal point at the centre and cropped by a margin that
+    # covers the largest shift, and its camera is written for the cropped image.
+    cameras = {}
+    for line in (model / 'cameras.txt').read_text().splitlines():
         fields = line.split()
-        if fields and not line.startswith('#') and fields[1] == 'SIMPLE_PINHOLE':
-            fields = fields[:1] + ['PINHOLE'] + fields[2:5] + [fields[4]] + fields[5:7]
-        cameras.append(' '.join(fields))
-    (workspace / 'sparse/0/cameras.txt').write_text('\n'.join(cameras) + '\n')
+        if not fields or line.startswith('#'):
+            continue
+        width, height = int(fields[2]), int(fields[3])
+        if fields[1] == 'SIMPLE_PINHOLE':
+            fx = fy = float(fields[4]); cx, cy = map(float, fields[5:7])
+        else:
+            fx, fy, cx, cy = map(float, fields[4:8])
+        cameras[fields[0]] = (width, height, fx, fy, cx, cy)
+    shift = max(max(abs(cx - w / 2), abs(cy - h / 2)) for w, h, _, _, cx, cy in cameras.values())
+    margin = int(np.ceil(shift))
+    (workspace / 'sparse/0/cameras.txt').write_text(''.join(
+        f'{key} PINHOLE {w - 2 * margin} {h - 2 * margin} {fx} {fy} {(w - 2 * margin) / 2} {(h - 2 * margin) / 2}\n'
+        for key, (w, h, fx, fy, cx, cy) in cameras.items()))
     lines, distances = [], []
     for fields in read_images(model):
         qw, qx, qy, qz, tx, ty, tz = map(float, fields[1:8])
@@ -73,13 +92,25 @@ def write_workspace(source: Path, sequence: Path, workspace: Path) -> tuple[np.n
         translation = (rotation @ center + np.array([tx, ty, tz])) / radius
         distances.append(np.linalg.norm(translation))
         lines += [' '.join(fields[:5] + [f'{value:.10f}' for value in translation] + fields[8:]), '']
-        image = sequence / 'frames' / fields[9]
         target = workspace / 'images' / fields[9]
         if not target.exists():
-            target.symlink_to(image.resolve())
+            w, h, _, _, cx, cy = cameras[fields[8]]
+            frame = cv2.imread(str(sequence / 'frames' / fields[9]))
+            moved = cv2.warpAffine(frame, np.float32([[1, 0, w / 2 - cx], [0, 1, h / 2 - cy]]), (w, h),
+                                   flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            cv2.imwrite(str(target), moved[margin:h - margin, margin:w - margin])
     (workspace / 'sparse/0/images.txt').write_text('\n'.join(lines) + '\n')
     points = []
-    for line in (model / 'points3D.txt').read_text().splitlines():
+    if init_points:
+        clouds = [o3d.io.read_point_cloud(str(path)) for path in init_points]
+        xyz = np.concatenate([np.asarray(cloud.points) for cloud in clouds])
+        rgb = np.concatenate([np.asarray(cloud.colors) if cloud.has_colors() else np.full((len(cloud.points), 3), .5)
+                              for cloud in clouds])
+        pick = np.random.default_rng(0).permutation(len(xyz))[:max_points]
+        for index, (point, colour) in enumerate(zip((xyz[pick] - center) / radius, rgb[pick] * 255), 1):
+            points.append(f'{index} {point[0]:.8f} {point[1]:.8f} {point[2]:.8f} '
+                          f'{int(colour[0])} {int(colour[1])} {int(colour[2])} 0')
+    for line in ([] if init_points else (model / 'points3D.txt').read_text().splitlines()):
         if not line or line.startswith('#'):
             continue
         fields = line.split()
@@ -124,9 +155,12 @@ def main() -> None:
     p.add_argument('--python', default=str(Path.home() / '.venvs/me566-2dgs/bin/python'))
     p.add_argument('--repo', type=Path, default=Path('third_party/2d-gaussian-splatting'))
     p.add_argument('--iterations', type=int, default=30000)
+    p.add_argument('--init-points', type=Path, nargs='+', default=[],
+                   help='Start from these point clouds (e.g. RUN/points/{object,scene}.ply) instead of the SfM points')
+    p.add_argument('--train-args', default='', help="Extra train.py options as one string, e.g. '--opacity_reset_interval 100000'")
     a = p.parse_args()
     workspace = a.output / '2dgs'
-    center, radius, depth_trunc = write_workspace(a.source, a.sequence, workspace)
+    center, radius, depth_trunc = write_workspace(a.source, a.sequence, workspace, a.init_points)
     repo = a.repo.resolve()
     started = time.time()
     trained_model = workspace / f'model/point_cloud/iteration_{a.iterations}/point_cloud.ply'
@@ -134,7 +168,7 @@ def main() -> None:
     if not reused:
         subprocess.run([a.python, 'train.py', '-s', str(workspace.resolve()), '-m', str((workspace / 'model').resolve()),
                         '--quiet', '--test_iterations', '-1', '--depth_ratio', '1.0', '-r', '1', '--lambda_dist', '1000',
-                        '--iterations', str(a.iterations), '--save_iterations', str(a.iterations)],
+                        '--iterations', str(a.iterations), '--save_iterations', str(a.iterations), *a.train_args.split()],
                        cwd=repo, check=True)
     trained = time.time()
     subprocess.run([a.python, 'render.py', '--iteration', str(a.iterations), '-s', str(workspace.resolve()),
@@ -149,7 +183,8 @@ def main() -> None:
     (a.output / 'mesh').mkdir(parents=True, exist_ok=True)
     o3d.io.write_triangle_mesh(str(a.output / 'mesh/object.ply'), mesh)
     shutil.copytree(a.source / 'poses/export', a.output / 'poses/export', dirs_exist_ok=True)
-    report = {'source': str(a.source), 'train_s': trained - started if not reused else None, 'reused_model': reused, 'mesh_s': meshed - trained,
+    report = {'source': str(a.source), 'init_points': [str(path) for path in a.init_points], 'iterations': a.iterations,
+              'train_args': a.train_args, 'train_s': trained - started if not reused else None, 'reused_model': reused, 'mesh_s': meshed - trained,
               'normalisation_center': center.tolist(), 'normalisation_radius': radius, 'depth_trunc': depth_trunc,
               'faces': len(mesh.triangles)}
     (a.output / 'twodgs.json').write_text(json.dumps(report, indent=2) + '\n')

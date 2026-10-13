@@ -9,7 +9,9 @@ SIGGRAPH 1996) is weighted by how much it is trusted:
              models a, b at that pixel: where VGGT and DA3 agree the fused
              depth is likely right;
   angle      cos(angle between viewing ray and surface normal), floored:
-             grazing views give noisier depth.
+             grazing views give noisier depth;
+  confirmed  1 where a check marked the pixel confirmed (--confirmed-dir, e.g.
+             PatchMatch's geometric pass), --unconfirmed-weight elsewhere.
 
 The grid covers only the object's bounds (landmarks plus a margin), so it can
 be dense and fine. Every frame projects every voxel centre into the image
@@ -58,6 +60,9 @@ def main() -> None:
                    help='Two independent depth models; weight pixels by their agreement')
     p.add_argument('--agreement-sigma', type=float, default=.01, help='Relative depth difference scale')
     p.add_argument('--angle-weight', action='store_true', help='Weight by viewing angle to the surface')
+    p.add_argument('--confirmed-dir', type=Path,
+                   help='<frame>_confirmed.npy masks (recon.depth.multiview.patchmatch --seed-dir)')
+    p.add_argument('--unconfirmed-weight', type=float, default=.2, help='Weight of pixels not confirmed')
     p.add_argument('--min-views', type=int, default=3,
                    help='Frames that must observe a voxel for it to hold surface (unweighted, as in the '
                         'scene TSDF), so low confidence changes the average but never deletes surface')
@@ -111,6 +116,10 @@ def main() -> None:
                     both = (first > 0) & (second > 0)
                     relative = np.where(both, np.log(np.maximum(first, 1e-6) / np.maximum(second, 1e-6)), 1.)
                     pixel_weight *= np.exp(-(relative / a.agreement_sigma) ** 2)
+            if a.confirmed_dir is not None:
+                confirmed = a.confirmed_dir / f'{number:08d}_confirmed.npy'
+                if confirmed.is_file():
+                    pixel_weight *= np.where(np.load(confirmed), 1., a.unconfirmed_weight).astype(np.float32)
             if a.angle_weight:
                 normals = camera_normals(depth, K)
                 height, width = depth.shape
@@ -161,6 +170,7 @@ def main() -> None:
     write_ply(a.output, vertices, colours, np.asarray(mesh.vertex_normals), faces[:, ::-1])
     report = {'method': 'confidence-weighted dense object TSDF', 'grid': shape.tolist(), 'voxel': a.voxel,
               'truncation': a.truncation, 'agreement': bool(a.agreement), 'agreement_sigma': a.agreement_sigma,
+              'confirmed_dir': str(a.confirmed_dir) if a.confirmed_dir else None, 'unconfirmed_weight': a.unconfirmed_weight,
               'angle_weight': a.angle_weight, 'min_views': a.min_views,
               'weight_floor': a.weight_floor, 'robust_passes': a.robust_passes,
               'robust_scale': a.robust_scale, 'frames': used,
