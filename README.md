@@ -139,6 +139,10 @@ keeps the photos' detail:
 | splat renders only | 0.9% | 20.0 |
 | **photos, gaps filled from renders** | **0.7%** | **23.9** |
 
+The closed mesh is decimated to `ASSET_MAX_FACES` (100,000) before texturing, because it carries several
+times the open mesh's faces and a fixed atlas then spreads too thin: at 100k the texture is 13% sharper
+than at 300k for 0.75 points more unpainted surface. Raise it for coverage, lower it for detail.
+
 Both stages need the gsplat environment (`make setup-gaussian`) and libigl; see
 [docs/PIPELINE.md](docs/PIPELINE.md) for the methods that did not work, including hole filling and
 Poisson reconstruction, which both leave the mesh open.

@@ -38,10 +38,25 @@ def held_out(numbers: list[int], every: int, offset: int) -> list[int]:
     return [number for index, number in enumerate(sorted(numbers)) if index % every == offset % every]
 
 
+def kept_few(numbers: list[int], keep: int) -> list[int]:
+    """Hold out everything except `keep` frames spread evenly over the sequence.
+
+    The inverse of `held_out`: that thins a capture, this reduces it to a handful of views, which is the
+    regime a multi-camera rig works in - a few simultaneous views rather than a dense orbit.
+    """
+    order = sorted(numbers)
+    if keep >= len(order):
+        return []
+    chosen = {order[index] for index in np.unique(np.linspace(0, len(order) - 1, keep).round().astype(int))}
+    return [number for number in order if number not in chosen]
+
+
 def split(a: argparse.Namespace) -> None:
     source, target = a.poses, a.run / 'poses'
     _, _, frames = parse_model(source / 'sparse_txt')
-    hold = set(held_out([number for number, *_ in frames], a.every, a.offset))
+    numbers = [number for number, *_ in frames]
+    keep = getattr(a, 'keep', 0)
+    hold = set(kept_few(numbers, keep) if keep else held_out(numbers, a.every, a.offset))
     if target.exists():
         shutil.rmtree(target)
     (target / 'sparse_txt').mkdir(parents=True)
@@ -135,6 +150,8 @@ def main() -> None:
         q.add_argument('--sequence', type=Path, required=True, help='Prepared sequence (masks/)')
         q.add_argument('--every', type=int, default=8)
         q.add_argument('--offset', type=int, default=4)
+        q.add_argument('--keep', type=int, default=0,
+                       help='Instead of thinning, keep only this many evenly spread frames (0: thin)')
     s = sub.choices['split']
     s.add_argument('--run', type=Path, required=True, help='New run folder; poses/ is written there')
     s = sub.choices['score']

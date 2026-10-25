@@ -186,6 +186,11 @@ WATERTIGHT_MESH := $(MESHES)/object_watertight.ply
 WATERTIGHT_ARGS ?=
 SPLAT_VIEWS_ARGS ?=
 ASSET_MESH ?= $(WATERTIGHT_MESH)
+# The closed mesh carries several times the open one's faces (jeep 307,872 against 54,835), so at a fixed
+# atlas each face gets a fraction of the texels and the texture goes soft. Decimating first trades a
+# little coverage for detail: at 4096 px, 300k faces gave 1.36% of the surface unpainted at Laplacian
+# sharpness 12.3, 100k gave 2.04% at 14.0 and 60k 2.13% at 16.0 (docs/PIPELINE.md).
+ASSET_MAX_FACES ?= 100000
 ASSET_GLB := $(MESHES)/asset.glb
 AGREEMENT_DEPTH := $(if $(ADAPTING),$(ADAPTED_DA3_DEPTH),$(DA3_DEPTH))
 CONSISTENT_DEPTH := $(DEPTH_ROOT)/consistent
@@ -479,7 +484,8 @@ watertight: $(WATERTIGHT_MESH)
 $(ASSET_GLB): $(ASSET_MESH) $(SPLAT_VIEWS)/trajectory.csv recon/surface/texture.py
 	@$(call stage,Textured asset)
 	$(Q)$(PYTHON) -m recon.surface.texture $(ASSET_MESH) --model $(MODEL) --trajectory $(TRAJECTORY) \
-	  --images $(TEXTURE_IMAGES) --sequence $(SEQ) --fill-views $(SPLAT_VIEWS) --output $@
+	  --images $(TEXTURE_IMAGES) --sequence $(SEQ) --fill-views $(SPLAT_VIEWS) \
+	  --max-faces $(ASSET_MAX_FACES) --output $@
 
 asset: $(ASSET_GLB)
 	@echo 'Asset:        $(abspath $(ASSET_GLB))'
