@@ -69,6 +69,9 @@ def main() -> None:
     parser.add_argument('--complete-masks', action='store_true',
                         help='Complete supplied masks with overlapping BiRefNet foreground')
     parser.add_argument('--refine-masks', action='store_true', help='Refine supplied masks with SAM-HQ')
+    parser.add_argument('--mask-dilate', type=int, default=2,
+                        help='Grow automatic masks by this many pixels (at a 960 px frame width): a mask '
+                             'slightly too tight costs far more than one slightly too loose')
     parser.add_argument('--scene', action='store_true', help='No masks: reconstruct the whole scene')
     parser.add_argument('--max-edge', type=int, default=1200, help='Working-frame size')
     parser.add_argument('--sample-fps', type=float, default=6., help='Frames per second kept from a video')
@@ -123,7 +126,8 @@ def main() -> None:
         if len(list(output.glob('*.png'))) == frames and (output.parent / f'{output.name}_birefnet.json').is_file():
             return output                                             # reuse a finished run
         subprocess.run([sys.executable, '-m', 'recon.masks.birefnet', str(sequence / 'frames'),
-                        '--output', str(output), *extra], check=True, cwd=root)
+                        '--output', str(output), '--dilate', str(args.mask_dilate), *extra],
+                       check=True, cwd=root)
         return output
 
     object_mode = not args.scene

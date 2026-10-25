@@ -85,6 +85,28 @@ def trajectory_alignment(ours: dict[int, np.ndarray], reference: list[np.ndarray
     return result.transformation, len(frames)
 
 
+def crop_bounds(trajectory: Path, scene_dir: Path, scene: str) -> np.ndarray:
+    """The benchmark's crop volume as an axis-aligned box in our own map frame.
+
+    Only step 1 of the protocol is used (RANSAC over camera centres against the reference trajectory), which
+    needs no mesh, so this can bound the TSDF before meshing. The box is the polygon's extent along the two
+    free axes and [axis_min, axis_max] along the orthogonal one, with its eight corners carried into our
+    frame; being axis-aligned there, it is a superset of the true volume, never a crop of scored surface.
+    """
+    ours = {frame: center for frame, (_, center) in load_poses(trajectory).items()}
+    reference = read_log(scene_dir / f'{scene}_COLMAP_SfM.log')
+    gt_transform = np.loadtxt(scene_dir / f'{scene}_trans.txt')
+    transform, _ = trajectory_alignment(ours, reference, gt_transform)
+    crop = json.loads((scene_dir / f'{scene}.json').read_text())
+    polygon = np.asarray(crop['bounding_polygon'], dtype=np.float64)
+    axis = int(crop['orthogonal_axis'].lower().replace('x', '0').replace('y', '1').replace('z', '2'))
+    low, high = polygon.min(0), polygon.max(0)
+    low[axis], high[axis] = min(crop['axis_min'], crop['axis_max']), max(crop['axis_min'], crop['axis_max'])
+    corners = np.array([[x, y, z] for x in (low[0], high[0]) for y in (low[1], high[1]) for z in (low[2], high[2])])
+    ours_frame = (corners - transform[:3, 3]) @ np.linalg.inv(transform[:3, :3]).T
+    return np.stack([ours_frame.min(0), ours_frame.max(0)])
+
+
 def evaluate(mesh: Path, trajectory: Path, scene_dir: Path, scene: str) -> dict:
     tau = TAU[scene]
     ours = {frame: center for frame, (_, center) in load_poses(trajectory).items()}
@@ -112,12 +134,28 @@ def evaluate(mesh: Path, trajectory: Path, scene_dir: Path, scene: str) -> dict:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('mesh', type=Path)
+    p.add_argument('mesh', type=Path, nargs='?', help='Omit with --print-bounds')
+    p.add_argument('--print-scale', action='store_true',
+                   help='Metres per map unit from the trajectory alignment, to set a voxel from the scene tau')
+    p.add_argument('--print-bounds', action='store_true',
+                   help="The crop volume as a box in our map frame, for recon.surface.tsdf --bounds")
     p.add_argument('--trajectory', type=Path, required=True)
     p.add_argument('--scene-dir', type=Path, required=True, help='Folder with <scene>.ply, .json, _trans.txt, _COLMAP_SfM.log')
     p.add_argument('--scene', choices=TAU, help='Default: the scene folder name')
-    p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--output', type=Path, help='Required without --print-bounds')
     a = p.parse_args()
+    scene = a.scene or a.scene_dir.name
+    if a.print_scale:
+        ours = {frame: center for frame, (_, center) in load_poses(a.trajectory).items()}
+        transform, _ = trajectory_alignment(ours, read_log(a.scene_dir / f'{scene}_COLMAP_SfM.log'),
+                                            np.loadtxt(a.scene_dir / f'{scene}_trans.txt'))
+        print(f'{float(np.linalg.norm(transform[:3, :3], axis=1).mean()):.6f} {TAU[scene]:.6f}')
+        return
+    if a.print_bounds:
+        print(' '.join(f'{value:.6f}' for value in crop_bounds(a.trajectory, a.scene_dir, scene).ravel()))
+        return
+    if a.mesh is None or a.output is None:
+        p.error('a mesh and --output are required without --print-bounds')
     report = evaluate(a.mesh, a.trajectory, a.scene_dir, a.scene or a.scene_dir.name)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_text(json.dumps(report, indent=2) + '\n')

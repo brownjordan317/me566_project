@@ -48,7 +48,7 @@ BYTES_PER_BLOCK = BLOCK_RESOLUTION ** 3 * (1 + 1 + 3) * 4
 
 def frame_blocks(depth: np.ndarray, valid: np.ndarray, K: np.ndarray,
                  rotation: np.ndarray, center: np.ndarray, block_size: float,
-                 truncation: float, stride: int = 4) -> np.ndarray:
+                 truncation: float, stride: int = 4, bounds: np.ndarray | None = None) -> np.ndarray:
     """Block keys within the truncation band of one frame's surface samples."""
     v, u = np.nonzero(valid[::stride, ::stride])
     z = depth[::stride, ::stride][v, u].astype('float64')
@@ -57,6 +57,8 @@ def frame_blocks(depth: np.ndarray, valid: np.ndarray, K: np.ndarray,
     camera = np.column_stack(((u - K[0, 2]) * z / K[0, 0],
                               (v - K[1, 2]) * z / K[1, 1], z))
     world = camera @ rotation.T + center
+    if bounds is not None:
+        world = world[np.all((world >= bounds[0] - truncation) & (world <= bounds[1] + truncation), axis=1)]
     keys = []
     # Corners of the truncation cube cover every block a sample can touch.
     for corner in np.array(np.meshgrid([-1, 1], [-1, 1], [-1, 1])).T.reshape(-1, 3):
@@ -66,14 +68,39 @@ def frame_blocks(depth: np.ndarray, valid: np.ndarray, K: np.ndarray,
     return np.unique(np.concatenate(keys))
 
 
-def estimate_block_count(frames, load_depth, intrinsics, poses, voxel, truncation) -> int:
+def frame_extent(depth: np.ndarray, K: np.ndarray, rotation: np.ndarray, center: np.ndarray,
+                 stride: int = 8) -> np.ndarray | None:
+    """World-frame box enclosing one frame's surface samples, or None if it has none."""
+    v, u = np.nonzero(depth[::stride, ::stride] > 0)
+    if not len(u):
+        return None
+    z = depth[::stride, ::stride][v, u].astype('float64')
+    u, v = u * stride, v * stride
+    camera = np.column_stack(((u - K[0, 2]) * z / K[0, 0], (v - K[1, 2]) * z / K[1, 1], z))
+    world = camera @ rotation.T + center
+    return np.stack([world.min(0), world.max(0)])
+
+
+def tile_boxes(bounds: np.ndarray, splits: int) -> list[np.ndarray]:
+    """`splits` cuts per axis over a world-frame box."""
+    edges = [np.linspace(bounds[0][axis], bounds[1][axis], splits + 1) for axis in range(3)]
+    boxes = []
+    for i in range(splits):
+        for j in range(splits):
+            for k in range(splits):
+                boxes.append(np.array([[edges[0][i], edges[1][j], edges[2][k]],
+                                       [edges[0][i + 1], edges[1][j + 1], edges[2][k + 1]]]))
+    return boxes
+
+
+def estimate_block_count(frames, load_depth, intrinsics, poses, voxel, truncation, bounds=None) -> int:
     def keys(frame_id):
         depth = load_depth(frame_id)
         if depth is None:
             return np.zeros(0, np.int64)
         rotation, center = poses[frame_id]
         return frame_blocks(depth, depth > 0, intrinsics[frame_id], rotation, center,
-                            voxel * BLOCK_RESOLUTION, truncation)
+                            voxel * BLOCK_RESOLUTION, truncation, bounds=bounds)
     blocks = np.zeros(0, np.int64)
     with ThreadPoolExecutor(8) as pool:
         for frame_keys in pool.map(keys, frames):
@@ -90,6 +117,13 @@ def main() -> None:
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--voxel', type=float, default=.02)
     p.add_argument('--sdf-trunc', type=float, default=.12)
+    p.add_argument('--tiles', type=int, default=0,
+                   help='With --bounds, mesh in this many cuts per axis and merge, so GPU memory is per tile '
+                        'and the voxel is no longer memory-bound; 0 picks the fewest cuts that fit')
+    p.add_argument('--bounds', type=float, nargs=6, metavar=('X0', 'Y0', 'Z0', 'X1', 'Y1', 'Z1'),
+                   help='Integrate only inside this world-frame box. A large capture spends its whole voxel '
+                        'budget on the full scene; bounding it to the region of interest buys a much finer '
+                        'voxel from the same memory (the grid is sparse, so memory grows as 1 / voxel^2)')
     p.add_argument('--block-count', type=int, default=0,
                    help='Voxel-block capacity; 0 sizes it from the depth maps')
     p.add_argument('--device', choices=('cuda', 'cpu'), default='cuda')
@@ -135,6 +169,9 @@ def main() -> None:
         return metric, color, int(np.count_nonzero(metric))
 
     frame_ids = sorted(poses)[:a.max_frames]
+    bounds = np.array(a.bounds, dtype=np.float64).reshape(2, 3) if a.bounds else None
+    if bounds is not None:
+        bounds = np.stack([bounds.min(0), bounds.max(0)])
     block_count = a.block_count
     if not block_count:
         # Open3D's CUDA hash map silently drops inserts and corrupts the volume
@@ -142,55 +179,138 @@ def main() -> None:
         # The old fixed 100000 stays the floor; small voxels need far more.
         with spinner('Sizing the TSDF volume'):
             needed = estimate_block_count(frame_ids, load_depth, intrinsics, poses,
-                                          a.voxel, a.sdf_trunc)
+                                          a.voxel, a.sdf_trunc, bounds)
         block_count = max(100000, 3 * needed)
+    budget = None
     if a.device == 'cuda':
         import torch
         free, _ = torch.cuda.mem_get_info()
-        if block_count * BYTES_PER_BLOCK > .8 * free:
+        budget = .8 * free
+        if block_count * BYTES_PER_BLOCK > budget and a.tiles == 1:
             p.error(f'TSDF needs about {block_count * BYTES_PER_BLOCK / 2**30:.1f} GiB but '
-                    f'{free / 2**30:.1f} GiB GPU memory is free; use a larger --voxel')
-    volume = o3d.t.geometry.VoxelBlockGrid(
-        ['tsdf', 'weight', 'color'], [o3d.core.Dtype.Float32] * 3,
-        [[1], [1], [3]], voxel_size=a.voxel, block_resolution=BLOCK_RESOLUTION,
-        block_count=block_count, device=device)
+                    f'{free / 2**30:.1f} GiB GPU memory is free; use a larger --voxel or allow tiling')
+    # Tiling: memory grows with the surface area in the grid, so cutting the box into t^3 tiles cuts the
+    # requirement by about t^2 and the voxel stops being memory-bound. Only the tile changes; every frame
+    # that can reach it is still integrated, so a tile's surface is the same as the untiled one.
+    splits = a.tiles
+    if not splits and budget is not None:
+        splits = max(1, int(np.ceil(np.sqrt(block_count * BYTES_PER_BLOCK / budget))))
+    splits = max(1, splits)
+    if splits > 1 and bounds is None:
+        # Tiling needs a box to cut, so take the one the depth maps occupy; the grid is sized from the
+        # depth anyway, and this keeps tiling available on a plain large scene with no region of interest.
+        with spinner('Bounding the depth for tiling'):
+            extent = [frame_extent(depth, intrinsics[f], *poses[f])
+                      for f, depth in ((f, load_depth(f)) for f in frame_ids) if depth is not None]
+            extent = [box for box in extent if box is not None]
+        if extent:
+            bounds = np.stack([np.min([b[0] for b in extent], 0), np.max([b[1] for b in extent], 0)])
+        else:
+            splits = 1
+    boxes = tile_boxes(bounds, splits) if (bounds is not None and splits > 1) else [bounds]
+    tile_blocks = max(100000, int(np.ceil(block_count / max(1, splits ** 2))))
+    if len(boxes) > 1:
+        print(f'TSDF in {len(boxes)} tiles ({splits} per axis), '
+              f'{tile_blocks * BYTES_PER_BLOCK / 2**30:.1f} GiB each')
+
+    cache: dict[int, tuple] = {}
+    extents: dict[int, np.ndarray] = {}
+
+    def frame(frame_id):
+        """Depth, colour and world extent, loaded once and kept for every tile."""
+        if frame_id not in cache:
+            loaded = load(frame_id)
+            cache[frame_id] = loaded
+            if loaded is not None:
+                rotation, center = poses[frame_id]
+                extents[frame_id] = frame_extent(loaded[0], intrinsics[frame_id], rotation, center)
+        return cache[frame_id]
+
     counts = []
     skipped = 0
-    # CPU loading overlaps GPU integration; frames still integrate in order.
+    blocks_used = 0
+    meshes = []
     reader = ThreadPoolExecutor(4)
-    prefetch = 8
-    loads = [reader.submit(load, frame_id) for frame_id in frame_ids[:prefetch]]
-    for index, frame_id in enumerate(bar(frame_ids, desc='TSDF fusion', unit='frame')):
-        if index + prefetch < len(frame_ids):
-            loads.append(reader.submit(load, frame_ids[index + prefetch]))
-        loaded = loads[index].result()
-        loads[index] = None
-        if loaded is None:
-            skipped += 1
+    for tile_index, box in enumerate(boxes):
+        volume = o3d.t.geometry.VoxelBlockGrid(
+            ['tsdf', 'weight', 'color'], [o3d.core.Dtype.Float32] * 3,
+            [[1], [1], [3]], voxel_size=a.voxel, block_resolution=BLOCK_RESOLUTION,
+            block_count=tile_blocks if len(boxes) > 1 else block_count, device=device)
+        if len(boxes) > 1:                      # only the frames whose surface can touch this tile
+            reach = [f for f in frame_ids if frame(f) is not None and extents.get(f) is not None
+                     and np.all(extents[f][1] + a.sdf_trunc >= box[0]) and np.all(extents[f][0] - a.sdf_trunc <= box[1])]
+        else:
+            reach = frame_ids
+        integrated = False
+        label = f'TSDF fusion ({tile_index + 1}/{len(boxes)})' if len(boxes) > 1 else 'TSDF fusion'
+        if not reach:
             continue
-        metric, color, valid_count = loaded
-        K = intrinsics[frame_id]
-        rotation, center = poses[frame_id]
-        extrinsic = np.eye(4)
-        extrinsic[:3, :3] = rotation.T
-        extrinsic[:3, 3] = -rotation.T @ center
-        depth_image = o3d.t.geometry.Image(o3d.core.Tensor(metric, device=device))
-        color_image = o3d.t.geometry.Image(o3d.core.Tensor(color, device=device))
-        K_tensor = o3d.core.Tensor(K, device=device)
-        E_tensor = o3d.core.Tensor(extrinsic, device=device)
-        blocks = volume.compute_unique_block_coordinates(
-            depth_image, K_tensor, E_tensor, depth_scale=1.,
-            depth_max=a.max_depth, trunc_voxel_multiplier=truncation_voxels)
-        volume.integrate(blocks, depth_image, color_image,
-                         K_tensor, K_tensor, E_tensor, depth_scale=1.,
-                         depth_max=a.max_depth,
-                         trunc_voxel_multiplier=truncation_voxels)
-        counts.append(valid_count)
+        # CPU loading overlaps GPU integration; frames still integrate in order.
+        prefetch = 8
+        loads = [reader.submit(frame, frame_id) for frame_id in reach[:prefetch]]
+        for index, frame_id in enumerate(bar(reach, desc=label, unit='frame')):
+            if index + prefetch < len(reach):
+                loads.append(reader.submit(frame, reach[index + prefetch]))
+            loaded = loads[index].result()
+            loads[index] = None
+            if loaded is None:
+                skipped += 1
+                continue
+            metric, color, valid_count = loaded
+            K = intrinsics[frame_id]
+            rotation, center = poses[frame_id]
+            extrinsic = np.eye(4)
+            extrinsic[:3, :3] = rotation.T
+            extrinsic[:3, 3] = -rotation.T @ center
+            depth_image = o3d.t.geometry.Image(o3d.core.Tensor(metric, device=device))
+            color_image = o3d.t.geometry.Image(o3d.core.Tensor(color, device=device))
+            K_tensor = o3d.core.Tensor(K, device=device)
+            E_tensor = o3d.core.Tensor(extrinsic, device=device)
+            blocks = volume.compute_unique_block_coordinates(
+                depth_image, K_tensor, E_tensor, depth_scale=1.,
+                depth_max=a.max_depth, trunc_voxel_multiplier=truncation_voxels)
+            if not len(blocks):                              # nothing of this frame lands in the grid
+                continue
+            if box is not None:
+                keys = blocks.cpu().numpy()                  # block coordinates live on the GPU
+                corner = keys * (a.voxel * BLOCK_RESOLUTION)
+                inside = np.all((corner + a.voxel * BLOCK_RESOLUTION >= box[0]) & (corner <= box[1]), axis=1)
+                if not inside.any():
+                    continue
+                blocks = o3d.core.Tensor(keys[inside], device=blocks.device)
+            integrated = True
+            volume.integrate(blocks, depth_image, color_image,
+                             K_tensor, K_tensor, E_tensor, depth_scale=1.,
+                             depth_max=a.max_depth,
+                             trunc_voxel_multiplier=truncation_voxels)
+        if len(boxes) > 1:
+            if not integrated:          # a tile no frame reaches holds no blocks, and extraction rejects that
+                del volume
+                o3d.core.cuda.release_cache()
+                continue
+            blocks_used += int(volume.hashmap().size())
+            piece = volume.extract_triangle_mesh(weight_threshold=a.min_views).to_legacy()
+            if len(piece.triangles):
+                # Blocks straddle a tile edge, so clip each piece to its own box; neighbours meet there.
+                piece = piece.crop(o3d.geometry.AxisAlignedBoundingBox(box[0], box[1]))
+                if len(piece.triangles):
+                    meshes.append(piece)
+            del volume
+            o3d.core.cuda.release_cache()
     reader.shutdown()
+    # Valid-pixel counts belong to the frames, not to any one tile: the first tile may reach only a few.
+    counts = [loaded[2] for loaded in cache.values() if loaded is not None]
     if len(counts) < 2:
         raise ValueError('Need at least two full-scene frames')
-    with spinner('Extracting the TSDF surface'):
-        mesh = volume.extract_triangle_mesh(weight_threshold=a.min_views).to_legacy()
+    if meshes:
+        mesh = meshes[0]
+        for piece in meshes[1:]:
+            mesh += piece
+        mesh = mesh.merge_close_vertices(a.voxel / 4)
+    else:
+        with spinner('Extracting the TSDF surface'):
+            blocks_used = int(volume.hashmap().size())
+            mesh = volume.extract_triangle_mesh(weight_threshold=a.min_views).to_legacy()
     if not len(mesh.triangles):
         raise ValueError('Full-scene TSDF produced no mesh')
     mesh.compute_vertex_normals()
@@ -205,7 +325,7 @@ def main() -> None:
               'min_depth_map_units': a.min_depth,
               'max_depth_map_units': a.max_depth,
               'block_count_capacity': block_count,
-              'blocks_used': int(volume.hashmap().size()), 'device': a.device,
+              'blocks_used': blocks_used, 'tiles': len(boxes), 'device': a.device,
               'discontinuity_tau_relative_per_pixel': a.discontinuity_tau,
               'vertices': len(mesh.vertices), 'faces': len(mesh.triangles)}
     a.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')

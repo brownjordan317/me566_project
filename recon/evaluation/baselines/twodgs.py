@@ -56,8 +56,8 @@ def normalisation(landmarks: Path) -> tuple[np.ndarray, float]:
     return center, float(np.quantile(np.linalg.norm(points - center, axis=1), .99))
 
 
-def write_workspace(source: Path, sequence: Path, workspace: Path,
-                    init_points: list[Path] = (), max_points: int = 300_000) -> tuple[np.ndarray, float, float]:
+def write_workspace(source: Path, sequence: Path, workspace: Path, init_points: list[Path] = (),
+                    max_points: int = 300_000, principal_offset: float = 0.) -> tuple[np.ndarray, float, float]:
     """images/ and a normalised sparse/0 for 2DGS; returns centre, radius and depth cut-off.
 
     With init_points (our coloured point clouds), they replace the sparse SfM points as the
@@ -96,7 +96,9 @@ def write_workspace(source: Path, sequence: Path, workspace: Path,
         if not target.exists():
             w, h, _, _, cx, cy = cameras[fields[8]]
             frame = cv2.imread(str(sequence / 'frames' / fields[9]))
-            moved = cv2.warpAffine(frame, np.float32([[1, 0, w / 2 - cx], [0, 1, h / 2 - cy]]), (w, h),
+            # principal_offset 0.5 lands it on (w - 1) / 2, where 3DGS-family rasterisers project (integer centres).
+            moved = cv2.warpAffine(frame, np.float32([[1, 0, w / 2 - principal_offset - cx],
+                                                      [0, 1, h / 2 - principal_offset - cy]]), (w, h),
                                    flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
             cv2.imwrite(str(target), moved[margin:h - margin, margin:w - margin])
     (workspace / 'sparse/0/images.txt').write_text('\n'.join(lines) + '\n')

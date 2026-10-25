@@ -79,6 +79,70 @@ DTU's shape chamfer improved on all 15 scans (mean 0.601 to 0.515 mm). The offic
 
 Single-image models (Depth Pro, Depth Anything V2, Marigold) were tested as extra candidates and removed. Their papers claim sharper edges and finer detail, but measured per region (outline, depth jumps, steep, textured, flat) none beat VGGT anywhere, and fine-scale (high-pass) detail is within 0.1–0.3 mm for every model. The filter picks them for under 1% of pixels, so they are left out of the default fusion. Smooth per-frame correction fields, even fitted to the true depth, recover only about 40% of the depth gap, so the remaining error is not smooth distortion.
 
+## Optimising against every photo (`make refine-gaussian`, optional)
+
+The default pipeline predicts depth one frame at a time and fuses the results. A second pass can instead fit one
+3D model to all the photos at once: Gaussian surfels are seeded from the first pass's checked depth and point
+clouds, then optimised until their renderings reproduce every image (colour, surface-normal agreement, and
+cross-view geometric and patch consistency), and depth is re-exported from the fitted model. The object mesh is
+then rebuilt from that depth. This is our own implementation on `gsplat` (Apache-2.0), following PGSR's published
+losses and weights; no PGSR code is used, so the geometry path stays free of its research-only licence.
+
+```bash
+make setup-gaussian                  # one-off: the gsplat environment
+make refine-gaussian SCENE=jeep RUN=runs/real/jeep KEEP_INTERMEDIATE=1
+```
+
+It needs `KEEP_INTERMEDIATE=1` (it reads the first pass's depth and points) and adds about 80–100 s per scene.
+Measured against the PGSR baseline on all 18 MobileBrick scenes, same base run and meshing for each:
+
+| Mean over 18 scenes | Default pipeline | + PGSR (baseline) | + this pass |
+| --- | --- | --- | --- |
+| F-score @ 1 mm | 53.91 | 57.28 | **59.84** |
+| Official F1 @ 2.5 mm | 65.02 | 66.50 | **68.03** |
+| Official chamfer (mm) | 5.76 | 5.92 | **5.75** |
+| Shape median (mm) | 0.71 | 0.64 | **0.56** |
+| Added time per scene | — | 117–142 s | 78–97 s |
+
+It is at least the PGSR baseline's F-score @ 1 mm on 17 of the 18 scenes. It is kept opt-in because it needs its
+own environment; see [docs/PIPELINE.md](docs/PIPELINE.md) for the two scenes where it loses coarse completeness
+against the default pipeline and why.
+
+## Watertight, textured asset (`make asset`, optional)
+
+The reconstructed mesh is a surface, not a solid: it is open where no view saw the object, and the
+texture is blank wherever the photos only see the surface edge-on. Two optional stages finish it.
+
+```bash
+make refine-gaussian SCENE=jeep RUN=runs/real/jeep KEEP_INTERMEDIATE=1   # also writes the Gaussians
+make asset SCENE=jeep RUN=runs/real/jeep KEEP_INTERMEDIATE=1
+```
+
+**Closing the mesh** (`make watertight`) takes the finished mesh as it is and computes its generalised
+winding number, bounded by the visual hull from the masks so the closure cannot bulge out through a large
+opening such as the base an object stands on. Nothing is re-meshed from the depth. On the development
+scenes this closes the mesh — no boundary edges, edge- and vertex-manifold, orientable — and costs 2.7 to
+3.7 points of the official F1 score, because enclosing a surface scanned from outside necessarily
+thickens it. Where the mesh is too open for the winding number to tell inside from outside the stage
+**refuses and says so** rather than returning a solid blob; one of the five development scenes is refused,
+and `ASSET_MESH=$(FINAL_MESH)` textures the open mesh instead.
+
+**Filling the texture** uses the fitted Gaussians. The photos leave about 8% of the surface unpainted
+even when every frame is projected, against the 1.1% that genuinely no view observed, so the limit is the
+photos' usable coverage rather than the capture's. Rendering the Gaussian model from cameras that face
+the mesh squarely covers that surface; the renders are used only where the photos have nothing, which
+keeps the photos' detail:
+
+| jeep texture | surface with no colour | sharpness (Laplacian std) |
+| --- | --- | --- |
+| photos, every frame | 8.0% | 23.2 |
+| splat renders only | 0.9% | 20.0 |
+| **photos, gaps filled from renders** | **0.7%** | **23.9** |
+
+Both stages need the gsplat environment (`make setup-gaussian`) and libigl; see
+[docs/PIPELINE.md](docs/PIPELINE.md) for the methods that did not work, including hole filling and
+Poisson reconstruction, which both leave the mesh open.
+
 ## Reconstruct your own capture
 
 For a folder of JPG or PNG images, or a video:
@@ -126,6 +190,13 @@ make rebuild-object MASKS=runs/real/mobilebrick_benchmark/london_bus/sam_hq/mask
 The [SAM-HQ](https://github.com/SysCV/sam-hq) adapter uses tracker masks as prompts and limits changes to their boundaries. It never uses reference masks as prompts. For isolated geometry work, the dataset's supplied masks let you skip tracking entirely. Source checkouts under `third_party/` are kept unmodified.
 
 ### Automatic masks (BiRefNet)
+
+Masks are grown by 2 px (at a 960 px frame width, scaled to the real width; `SCAN_MASK_DILATE=0` turns it
+off). Reconstruction is far more forgiving of a mask slightly too generous than one slightly too tight: on
+jeep, with the depth held fixed, eroding the masks by 2 px costs 12.6 points of the official F1 score and
+by 10 px costs 59, while dilating by 2 px gains 0.2 and by 10 px costs 0.8. Erosion does not distort the
+surface, it deletes it — the shape median barely moves either way — and the mask vote and the TSDF's
+weighting already discard surplus background. If you supply your own masks, err on the generous side.
 
 `python3 -m recon.masks.birefnet FRAMES --output DIR` writes one mask per frame from BiRefNet, a high-resolution foreground segmenter (MIT). Add `--guide MASKS` to complete existing masks instead: only foreground pieces that overlap the supplied mask of the same frame are kept. The model code is fetched from Hugging Face and pinned to a reviewed revision; `make setup` downloads it.
 
@@ -193,6 +264,8 @@ This project's own code may be released openly. Its default pipeline also uses m
 | MoGe-3 | Background depth | MIT | — |
 | BiRefNet (code and weights) | Masks for `make construct` without supplied masks; optional mask completion | MIT | — |
 | SAM-HQ | Optional mask refinement | Apache-2.0 | — |
+| gsplat | Planar-Gaussian refinement (`make refine-gaussian`, optional second pass, own environment) | Apache-2.0 | — |
+| libigl | Watertight closure (`make watertight`, generalised winding number) | MPL-2.0 | — |
 | Open3D, PyTorch, SciPy, rich, tqdm, halo | Fusion, utilities | MIT / BSD | — |
 | MASt3R, VGGT-Ω, DA3-Large/Giant, 2DGS, PGSR (`recon/evaluation/baselines`) | Comparisons only | Non-commercial (2DGS: Gaussian-Splatting License; PGSR: research and non-profit use only) | — |
 

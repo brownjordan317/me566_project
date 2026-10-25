@@ -93,6 +93,9 @@ SCAN_FPS ?= 6
 # SCAN_MASK_COMMAND='program {frames} {output}' (any external generator writing one NNNNNNNN.png
 # per frame); SCAN_COMPLETE_MASKS=1 fills in parts they miss with BiRefNet, SCAN_REFINE_MASKS=1
 # refines their edges with SAM-HQ. SCAN_SCENE=1 skips masks and reconstructs the whole scene.
+# Automatic masks are grown slightly: a mask 2 px too tight costs 12.6 points of MobileBrick F1 while one
+# 10 px too loose costs 0.8 (docs/PIPELINE.md). Scaled to the frame width; 0 turns it off.
+SCAN_MASK_DILATE ?= 2
 SCAN_MASKS ?=
 SCAN_MASK_COMMAND ?=
 SCAN_COMPLETE_MASKS ?=
@@ -166,6 +169,24 @@ GEOMETRIC ?=
 GEOMETRIC_DEPTH := $(DEPTH_ROOT)/geometric
 GEOMETRIC_ARGS ?=
 OBJECT_DEPTH_INPUT := $(if $(GEOMETRIC),$(GEOMETRIC_DEPTH),$(PRE_GEOMETRIC_DEPTH))
+# GAUSSIAN=1 (make refine-gaussian): our planar-Gaussian refinement, a per-scene optimiser that fits Gaussians to
+# every photo and re-exports depth (recon/depth/gaussian_refine.py, needs the gsplat venv: make setup-gaussian).
+# It seeds from the first pass's checked depth and point clouds, so it runs after them and the object mesh is
+# rebuilt from its depth. Measured better than the PGSR baseline on 17 of 18 MobileBrick scenes (docs/PIPELINE.md).
+GAUSSIAN_PYTHON ?= $(HOME)/.venvs/me566-pgsr/bin/python
+GAUSSIAN_DEPTH := $(DEPTH_ROOT)/gaussian
+GAUSSIAN_ARGS ?=
+GAUSSIAN_PLY := $(GAUSSIAN_DEPTH)/gaussians.ply
+# Watertight closure and splat-filled texture, the asset-facing finish (make asset). The closure is the
+# finished mesh's generalised winding number bounded by the mask hull, and it refuses rather than guess on
+# a mesh too open for that to separate inside from outside; the texture takes texels the photos leave
+# unpainted from renders of the fitted Gaussians. Both need the gsplat/libigl environment where noted.
+SPLAT_VIEWS := $(WORK)/splat_views
+WATERTIGHT_MESH := $(MESHES)/object_watertight.ply
+WATERTIGHT_ARGS ?=
+SPLAT_VIEWS_ARGS ?=
+ASSET_MESH ?= $(WATERTIGHT_MESH)
+ASSET_GLB := $(MESHES)/asset.glb
 AGREEMENT_DEPTH := $(if $(ADAPTING),$(ADAPTED_DA3_DEPTH),$(DA3_DEPTH))
 CONSISTENT_DEPTH := $(DEPTH_ROOT)/consistent
 SCENE_MESH := $(WORK)/scene.ply
@@ -174,6 +195,10 @@ OBJECT_MESH := $(WORK)/object.ply
 # pixels count by VGGT-DA3 agreement and viewing angle; surface still needs 3 observing frames.
 # OBJECT_TSDF=scene extracts the object from the scene TSDF instead (the earlier default).
 OBJECT_TSDF ?= weighted
+# Extra recon.surface.tsdf options for the scene mesh, e.g. TSDF_ARGS='--voxel .04'. The default voxel suits an
+# object capture; a whole outdoor scene (Tanks and Temples) needs a coarser one to fit the GPU, as the sparse block
+# grid's memory grows as 1/voxel^2. Pick the finest that fits, which the stage reports when it does not.
+TSDF_ARGS ?=
 # Extra recon.surface.weighted_tsdf options, e.g. OBJECT_TSDF_ARGS='--voxel .01 --truncation .03'.
 OBJECT_TSDF_ARGS ?=
 WEIGHTED_OBJECT_MESH := $(WORK)/object_tsdf.ply
@@ -217,7 +242,7 @@ PRUNE_COMMAND = test -n "$(SCENE)" && test -d "$(RUN)/poses" && rm -rf "$(DEPTH_
 	&& rm -f "$(POSE)"/*.log "$(MESHES)"/*.json "$(POINTS)"/*.json && echo 'Pruned intermediates in $(RUN)'
 PRUNE = $(if $(KEEP_INTERMEDIATE),,$(if $(filter $@,$(lastword $(MAKECMDGOALS))),@$(PRUNE_COMMAND)))
 
-.PHONY: report view_ply stage-ranking prepare-dtu evaluate-dtu setup-vggt benchmark help setup setup-masks download prepare reconstruct rebuild-object construct poses depth scene object evaluate test status refine-masks setup-omega setup-patchmatch
+.PHONY: watertight asset report view_ply stage-ranking prepare-dtu evaluate-dtu setup-vggt benchmark help setup setup-masks download prepare reconstruct rebuild-object construct poses depth scene object evaluate test status refine-masks setup-omega setup-patchmatch
 
 help:
 	@echo 'Inputs are RGB frames plus object masks; cameras are estimated from the images.'
@@ -229,6 +254,10 @@ help:
 	@echo '                           OMEGA=1 adds VGGT-Omega as a third fusion candidate'
 	@echo '                           PATCHMATCH=1 adds COLMAP PatchMatch stereo as a fusion candidate'
 	@echo '                           GEOMETRIC=1 runs PatchMatch geometric consistency seeded with the refined depth'
+	@echo '  watertight               close the finished object mesh (winding number bounded by the mask hull)'
+	@echo '  asset                    closed mesh textured from the photos, gaps filled from splat renders'
+	@echo '  refine-gaussian          second pass: planar-Gaussian refinement, then rebuild the mesh from its depth'
+	@echo '                           (make setup-gaussian first; GAUSSIAN_ARGS passes options)'
 	@echo '                           and point clouds -> RUN/points/object.ply, scene.ply'
 	@echo 'make evaluate              Score the object mesh and poses against the MobileBrick reference'
 	@echo 'make evaluate-dtu          Chamfer of the object mesh (or EVAL_MESH) against the DTU laser scan'
@@ -409,9 +438,59 @@ reconstruct: $(FINAL_MESH) $(if $(TEXTURE),$(TEXTURED_MESH),) $(call scene_mesh,
 
 # After changing MASKS: rebuild the mask-dependent depth and meshes (needs KEEP_INTERMEDIATE=1 runs).
 rebuild-object:
-	rm -rf $(HYBRID_DEPTH) $(FUSED_DEPTH) $(REFINED_FUSED_DEPTH) $(CONSISTENT_DEPTH) $(DA3_HEAD) $(ADAPTED_DA3_DEPTH) $(ADAPTED_HYBRID_DEPTH) $(ADAPTED_REFINED_DEPTH) $(GEOMETRIC_DEPTH)
+	rm -rf $(HYBRID_DEPTH) $(FUSED_DEPTH) $(REFINED_FUSED_DEPTH) $(CONSISTENT_DEPTH) $(DA3_HEAD) $(ADAPTED_DA3_DEPTH) $(ADAPTED_HYBRID_DEPTH) $(ADAPTED_REFINED_DEPTH) $(GEOMETRIC_DEPTH) $(GAUSSIAN_DEPTH)
 	rm -f $(SCENE_MESH) $(OBJECT_MESH) $(FINAL_MESH) $(FINAL_SCENE) $(SCENE_POINTS) $(OBJECT_POINTS) $(METRICS)/object.json
 	$(MAKE) reconstruct SCENE=$(SCENE) RUN=$(RUN) MASKS=$(MASKS)
+
+$(GAUSSIAN_DEPTH)/hybrid_depth.json: $(OBJECT_POINTS) $(CONSISTENT_DEPTH)/consistency.json recon/depth/gaussian_refine.py
+	@$(call stage,Planar-Gaussian refinement)
+	$(Q)$(GPU) $(GAUSSIAN_PYTHON) -m recon.depth.gaussian_refine $(SEQ) --model $(MODEL) \
+	  --init-points $(OBJECT_POINTS) $(SCENE_POINTS) --init-depth $(CONSISTENT_DEPTH) --init-opacity 0.3 \
+	  --output-dir $(GAUSSIAN_DEPTH) --export-gaussians $(GAUSSIAN_PLY) $(GAUSSIAN_ARGS)
+
+# Second pass: optimise, then rebuild every depth-derived output from the optimised depth.
+refine-gaussian: $(GAUSSIAN_DEPTH)/hybrid_depth.json
+	rm -rf $(CONSISTENT_DEPTH)
+	rm -f $(SCENE_MESH) $(OBJECT_MESH) $(FINAL_MESH) $(FINAL_SCENE) $(SCENE_POINTS) $(OBJECT_POINTS) $(METRICS)/object.json
+	$(MAKE) reconstruct SCENE=$(SCENE) RUN=$(RUN) MASKS=$(MASKS) OBJECT_DEPTH_INPUT=$(abspath $(GAUSSIAN_DEPTH))
+
+# The refinement stage writes the PLY beside its depth. It is deliberately *not* derived from that rule
+# here: refine-gaussian rebuilds the depth its own stage depends on, so making this a derived target had
+# `make asset` re-run the whole optimiser (a second 90 s pass) to refresh a file that was already correct.
+$(GAUSSIAN_PLY):
+	@test -f $@ || { echo 'No $@; run make refine-gaussian first (it writes the Gaussians)'; exit 2; }
+
+# The fitted Gaussians rendered from cameras facing the mesh, for texels the photos never see squarely.
+$(SPLAT_VIEWS)/trajectory.csv: $(GAUSSIAN_PLY) $(FINAL_MESH) recon/surface/splat_views.py
+	@$(call stage,Splat views for texturing)
+	$(Q)$(GPU) $(GAUSSIAN_PYTHON) -m recon.surface.splat_views $(GAUSSIAN_PLY) --mesh $(FINAL_MESH) \
+	  --output $(SPLAT_VIEWS) --trajectory $(TRAJECTORY) $(SPLAT_VIEWS_ARGS)
+
+$(WATERTIGHT_MESH): $(FINAL_MESH) recon/surface/watertight.py
+	@$(call stage,Watertight closure)
+	$(Q)$(GPU) $(PYTHON) -m recon.surface.watertight $(SEQ) --mesh $(FINAL_MESH) --model $(MODEL) \
+	  --trajectory $(TRAJECTORY) --output $@ $(WATERTIGHT_ARGS)
+
+watertight: $(WATERTIGHT_MESH)
+	@echo 'Watertight:   $(abspath $(WATERTIGHT_MESH))'
+
+# A closed, textured asset: ASSET_MESH=$(FINAL_MESH) textures the open mesh instead, for a scene whose
+# closure is refused.
+$(ASSET_GLB): $(ASSET_MESH) $(SPLAT_VIEWS)/trajectory.csv recon/surface/texture.py
+	@$(call stage,Textured asset)
+	$(Q)$(PYTHON) -m recon.surface.texture $(ASSET_MESH) --model $(MODEL) --trajectory $(TRAJECTORY) \
+	  --images $(TEXTURE_IMAGES) --sequence $(SEQ) --fill-views $(SPLAT_VIEWS) --output $@
+
+asset: $(ASSET_GLB)
+	@echo 'Asset:        $(abspath $(ASSET_GLB))'
+
+setup-gaussian:
+	python3 -m venv $(HOME)/.venvs/me566-pgsr
+	$(HOME)/.venvs/me566-pgsr/bin/pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+	$(HOME)/.venvs/me566-pgsr/bin/pip install numpy opencv-python-headless open3d plyfile
+	CUDA_HOME=/usr/local/cuda-12.9 TORCH_CUDA_ARCH_LIST=8.9 \
+	  NVCC_APPEND_FLAGS="-include cfloat -include cstdint" CXXFLAGS="-include cstdint" \
+	  $(HOME)/.venvs/me566-pgsr/bin/pip install --no-build-isolation gsplat==1.5.3
 
 evaluate: $(FINAL_MESH)
 	@$(call stage,Scoring mesh)
@@ -481,4 +560,4 @@ endif
 
 construct:
 	@test -e "$(SCAN)" || { echo 'Use make construct path/to/images_or_video.mp4 or make construct SCAN=path'; exit 2; }
-	$(PYTHON) -m recon.apps.construct "$(SCAN)" --output "$(SCAN_OUTPUT)" --max-edge $(SCAN_MAX_EDGE) --sample-fps $(SCAN_FPS) $(if $(SCAN_MASKS),--masks "$(SCAN_MASKS)",) $(if $(SCAN_MASK_COMMAND),--mask-command '$(SCAN_MASK_COMMAND)',) $(if $(SCAN_COMPLETE_MASKS),--complete-masks,) $(if $(SCAN_REFINE_MASKS),--refine-masks,) $(if $(SCAN_SCENE),--scene,)
+	$(PYTHON) -m recon.apps.construct "$(SCAN)" --output "$(SCAN_OUTPUT)" --max-edge $(SCAN_MAX_EDGE) --sample-fps $(SCAN_FPS) $(if $(SCAN_MASKS),--masks "$(SCAN_MASKS)",) $(if $(SCAN_MASK_COMMAND),--mask-command '$(SCAN_MASK_COMMAND)',) $(if $(SCAN_COMPLETE_MASKS),--complete-masks,) $(if $(SCAN_REFINE_MASKS),--refine-masks,) --mask-dilate $(SCAN_MASK_DILATE) $(if $(SCAN_SCENE),--scene,)

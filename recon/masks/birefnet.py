@@ -42,6 +42,9 @@ def load_model(device: str, revision: str = REVISION):
     return model.half() if device.startswith('cuda') else model
 
 
+REFERENCE_WIDTH = 960                 # the frame width the dilation default was measured at
+
+
 def foreground(model, image: np.ndarray, threshold: float = .5) -> np.ndarray:
     """Binary foreground of an RGB uint8 image at its own resolution."""
     x = (cv2.resize(image, (1024, 1024)).astype(np.float32) / 255 - MEAN) / STD
@@ -50,6 +53,24 @@ def foreground(model, image: np.ndarray, threshold: float = .5) -> np.ndarray:
     with torch.no_grad():
         probability = model(x)[-1].sigmoid()[0, 0].float().cpu().numpy()
     return cv2.resize(probability, (image.shape[1], image.shape[0])) > threshold
+
+
+def widen(mask: np.ndarray, pixels: int, width: int = REFERENCE_WIDTH) -> np.ndarray:
+    """Grow a mask by `pixels`, scaled to the frame width so the margin is the same share of the object.
+
+    Reconstruction is far more forgiving of a mask that is slightly too generous than of one slightly too
+    tight (measured on jeep with the depth held fixed, docs/PIPELINE.md): eroding the masks by 2 px costs
+    12.6 points of official F1@2.5 and by 10 px costs 59, while dilating by 2 px gains 0.2 and by 10 px
+    costs 0.8. The reason is visible in the shape median, which barely moves either way - erosion does not
+    distort the surface, it deletes it, and the mask vote and the TSDF's weighting already discard surplus
+    background. So the automatic masks are grown slightly by default. Note this deliberately lowers the
+    masks' own agreement with a reference matte: the quantity being traded for is reconstruction coverage.
+    """
+    if pixels <= 0:
+        return mask
+    radius = max(1, int(round(pixels * mask.shape[1] / width)))
+    kernel = np.ones((2 * radius + 1,) * 2, np.uint8)
+    return cv2.dilate(mask.astype(np.uint8), kernel) > 0
 
 
 def keep_guided(full: np.ndarray, guide: np.ndarray, min_overlap: float = .3) -> np.ndarray:
@@ -77,6 +98,9 @@ def main() -> None:
     p.add_argument('--guide', type=Path, help='Supplied masks to complete (same file names)')
     p.add_argument('--reference-masks', type=Path, help='Optional evaluation only')
     p.add_argument('--threshold', type=float, default=.5)
+    p.add_argument('--dilate', type=int, default=2,
+                   help='Grow each mask by this many pixels at a 960 px frame width, scaled to the real '
+                        'width; a mask slightly too tight is far more costly than one slightly too loose')
     p.add_argument('--revision', default=REVISION)
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     a = p.parse_args()
@@ -94,6 +118,7 @@ def main() -> None:
             if guide is None:
                 raise FileNotFoundError(a.guide / path.name)
             mask = keep_guided(mask, guide > 127)
+        mask = widen(mask, a.dilate)
         empty += not mask.any()
         cv2.imwrite(str(a.output / path.name), mask.astype(np.uint8) * 255)
         if a.reference_masks is not None:

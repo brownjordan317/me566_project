@@ -79,6 +79,8 @@ def main() -> None:
     p.add_argument('--discontinuity-tau', type=float, default=.03)
     p.add_argument('--min-depth', type=float, default=.5)
     p.add_argument('--max-depth', type=float, default=30.)
+    p.add_argument('--export-field', type=Path,
+                   help='Also write the fused field as .npz for recon.surface.watertight')
     p.add_argument('--device', default='cuda')
     a = p.parse_args()
     device = a.device
@@ -175,6 +177,15 @@ def main() -> None:
               'weight_floor': a.weight_floor, 'robust_passes': a.robust_passes,
               'robust_scale': a.robust_scale, 'frames': used,
               'faces': int(len(faces))}
+    if a.export_field is not None:
+        # The same field this stage meshes, so a later stage can close it without re-integrating depth
+        # (recon.surface.watertight); re-integrating with a plain average loses this stage's weighting.
+        a.export_field.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(a.export_field, tsdf=volume.astype(np.float32),
+                 views=views.reshape(*shape).cpu().numpy().astype(np.int16),
+                 colour=grid.astype(np.float32), low=low.astype(np.float64),
+                 voxel=np.float64(a.voxel), truncation=np.float64(a.truncation),
+                 min_views=np.int32(a.min_views))
     a.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
     done(f"Weighted TSDF: {used} frames, grid {'x'.join(map(str, shape))}, {len(faces):,} faces")
 
