@@ -38,6 +38,16 @@ def held_out(numbers: list[int], every: int, offset: int) -> list[int]:
     return [number for index, number in enumerate(sorted(numbers)) if index % every == offset % every]
 
 
+def kept_arc(numbers: list[int], low: int, high: int) -> list[int]:
+    """Hold out everything outside the frame range [low, high].
+
+    A contiguous arc, unlike thinning or an evenly spread handful: the surface the dropped views saw is
+    then genuinely unobserved, which is what a test of inferred colour or geometry needs. Interleaved
+    held-out views see almost the same surface as the kept ones and test nothing.
+    """
+    return [number for number in sorted(numbers) if not low <= number <= high]
+
+
 def kept_few(numbers: list[int], keep: int) -> list[int]:
     """Hold out everything except `keep` frames spread evenly over the sequence.
 
@@ -55,8 +65,11 @@ def split(a: argparse.Namespace) -> None:
     source, target = a.poses, a.run / 'poses'
     _, _, frames = parse_model(source / 'sparse_txt')
     numbers = [number for number, *_ in frames]
-    keep = getattr(a, 'keep', 0)
-    hold = set(kept_few(numbers, keep) if keep else held_out(numbers, a.every, a.offset))
+    keep, arc = getattr(a, 'keep', 0), getattr(a, 'arc', None)
+    if arc:
+        hold = set(kept_arc(numbers, *arc))
+    else:
+        hold = set(kept_few(numbers, keep) if keep else held_out(numbers, a.every, a.offset))
     if target.exists():
         shutil.rmtree(target)
     (target / 'sparse_txt').mkdir(parents=True)
@@ -150,6 +163,8 @@ def main() -> None:
         q.add_argument('--sequence', type=Path, required=True, help='Prepared sequence (masks/)')
         q.add_argument('--every', type=int, default=8)
         q.add_argument('--offset', type=int, default=4)
+        q.add_argument('--arc', type=int, nargs=2, metavar=('LOW', 'HIGH'),
+                       help='Keep only frames in this inclusive range, holding out the rest')
         q.add_argument('--keep', type=int, default=0,
                        help='Instead of thinning, keep only this many evenly spread frames (0: thin)')
     s = sub.choices['split']

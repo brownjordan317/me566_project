@@ -41,3 +41,10 @@ def test_kept_few_holds_out_nothing_when_asked_for_everything():
     from recon.evaluation.diagnostics.heldout import kept_few
     assert kept_few([3, 1, 2], 3) == []
     assert kept_few([3, 1, 2], 9) == []
+
+
+def test_kept_arc_holds_out_everything_outside_the_range():
+    from recon.evaluation.diagnostics.heldout import kept_arc
+    assert kept_arc(list(range(10)), 2, 5) == [0, 1, 6, 7, 8, 9]
+    assert kept_arc([7, 1, 4], 0, 10) == []
+    assert sorted(kept_arc(list(range(5)), 9, 9)) == [0, 1, 2, 3, 4]
