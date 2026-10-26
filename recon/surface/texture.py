@@ -37,9 +37,13 @@ def texel_points(vertices: np.ndarray, faces: np.ndarray, uvs: np.ndarray,
     """
     points = np.zeros((size, size, 3), np.float32)
     covered = np.zeros((size, size), bool)
+    # v is not flipped: the albedo Open3D produces is already in the row order its UVs index. Flipping
+    # here put every texel's surface point at its vertical mirror - median position error 0.81 map units
+    # against 0.0003 unflipped, checked against ray-cast surface points - which silently made the mirror
+    # fill copy colour from the wrong place.
     pixel = uvs.copy()
     pixel[:, 0] *= size - 1
-    pixel[:, 1] = (1 - pixel[:, 1]) * (size - 1)
+    pixel[:, 1] *= size - 1
     for triangle in faces:
         uv = pixel[triangle]
         low = np.floor(uv.min(0)).astype(int)

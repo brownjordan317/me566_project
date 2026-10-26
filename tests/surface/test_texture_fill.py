@@ -21,6 +21,17 @@ def test_texel_points_covers_the_atlas_and_places_points_on_the_surface():
     assert points[covered][:, :2].max() <= 1 + 1e-5
 
 
+def test_texel_points_uses_the_albedo_row_order_not_a_flipped_one():
+    # Here uv equals the vertex's own (x, y), so texel (col, row) must hold the point
+    # (col, row) / (size - 1). A flipped v would mirror every point vertically instead.
+    vertices, faces, uvs = unit_square()
+    size = 16
+    points, covered = texel_points(vertices, faces, uvs, size)
+    rows, cols = np.nonzero(covered)
+    expected = np.stack([cols / (size - 1), rows / (size - 1)], 1)
+    assert np.abs(points[covered][:, :2] - expected).max() < .02
+
+
 def test_texel_points_leaves_texels_no_triangle_covers_uncovered():
     vertices, faces, uvs = unit_square()
     uvs = uvs * .5                                               # charts now fill only a corner
