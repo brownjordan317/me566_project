@@ -2,9 +2,16 @@
 
 This file records code in `recon/` that was adapted from other projects, with
 the licence notices those projects require. Libraries and models that are only
-called (COLMAP, LightGlue, SuperPoint, ALIKED, MoGe, VGGT, SAM-HQ, BiRefNet, 2DGS, Open3D, PyTorch) keep
+called (COLMAP, LightGlue, SuperPoint, ALIKED, MoGe, VGGT, SAM-HQ, BiRefNet, 2DGS, Open3D, PyTorch,
+gsplat, libigl, xatlas, scikit-image, SciPy) keep
 their own licences in `third_party/` or their packages; see the README's
 "Licences of components" and "Credits and citations" sections.
+
+`recon/depth/gaussian_refine.py` is not listed below: it reimplements PGSR's published method from the
+paper and contains none of its code, as its docstring records. The methods the newer stages call are
+credited where they are used - the generalised winding number (Jacobson et al., SIGGRAPH 2013; Barill et
+al., SIGGRAPH 2018) through libigl in `recon/surface/watertight.py`, shape from silhouette (Laurentini,
+TPAMI 1994) for the visual hull there, and xatlas for UV unwrapping in `recon/surface/texture.py`.
 
 # Adapted code
 

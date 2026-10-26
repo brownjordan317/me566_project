@@ -588,10 +588,6 @@ def main() -> None:
                    help='Start from trained 3D Gaussians (3DGS / PGSR point_cloud.ply in a normalised frame) instead '
                         'of seeding; with --init-frame LANDMARKS the frame is undone as twodgs.normalisation')
     p.add_argument('--init-frame', type=Path, help='Landmarks the --init-gaussians frame was normalised by')
-    p.add_argument('--primitive', choices=('2d', '3d'), default='2d',
-                   help='2D surfels (gsplat 2DGS) or flattened 3D Gaussians with plane depth (PGSR-style)')
-    p.add_argument('--flat-weight', type=float, default=100., help='3d: weight of the smallest-scale loss')
-    p.add_argument('--init-isotropic', action='store_true', help='3d: start round and unrotated, as 3DGS / PGSR')
     p.add_argument('--trim-every', type=int, default=0, help='Multi-view trim every N iterations (PGSR: 1000; 0 = off)')
     p.add_argument('--trim-views', type=int, default=2, help='Prune Gaussians seen on the surface by fewer views')
     p.add_argument('--sh-degree', type=int, default=3, help='Spherical-harmonic colour degree, raised every 1000 iterations')
@@ -634,10 +630,6 @@ def main() -> None:
         from recon.evaluation.baselines.twodgs import normalisation
         center, radius = normalisation(a.init_frame) if a.init_frame is not None else (np.zeros(3), 1.)
         gaussians = load_gaussians(a.init_gaussians, device, center, radius)
-        gaussians.flat_weight = a.flat_weight
-    elif a.primitive == '3d':
-        gaussians = Gaussians3D(xyz, rgb, normals, spacing, device, a.init_opacity, a.init_size, a.flat_weight,
-                                a.init_isotropic)
     else:
         gaussians = Gaussians(xyz, rgb, normals, spacing, device, a.init_opacity, a.init_size)
         gaussians.export = a.export

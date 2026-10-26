@@ -114,12 +114,20 @@ PRIMARY_SUMMARY = $(if $(filter omega,$(DEPTH_MODEL)),$(OMEGA_DEPTH)/candidate.j
 HYBRID_DEPTH := $(DEPTH_ROOT)/hybrid
 # Default: add DA3 depth and pick VGGT or DA3 region by region with full-resolution photometric
 # evidence (recon.depth.fusion.filter); everything downstream uses the fused depth.
+# FUSION_ARGS passes extra options, e.g. FUSION_ARGS='--combine mean' to average the candidates instead
+# of choosing between them by patch score.
 # FUSION= (empty) keeps VGGT object depth alone.
+FUSION_ARGS ?=
 FUSION ?= 1
 DA3_CHECKPOINT ?= depth-anything/DA3-GIANT
 # DA3 input resolution: 756 beat 504 on every development scene (p90 5-11% lower); 1008 runs out of
 # memory on a 24 GB GPU.
 DA3_RES ?= 756
+# Extra recon.depth.multiview.da3 options. Memory is window x resolution, so a smaller window buys a
+# higher resolution: DA3_RES=1008 DA3_ARGS='--window 8 --step 4' lowers the median depth error on every
+# development scene (jeep -16%, audi -9%, convertible -7%, big_ben -2%) for about 1.5x the stage's time,
+# where 756 with the default window of 16 is simply where memory ran out (docs/PIPELINE.md).
+DA3_ARGS ?=
 FUSION_IMAGES ?= $(DATA)/$(SCENE)/image
 DA3_DEPTH := $(DEPTH_ROOT)/da3
 # Models (MoGe, VGGT, DA3, VGGT-Omega) read the original photos, not the downsized working frames; they
@@ -368,7 +376,7 @@ $(HYBRID_DEPTH)/hybrid_depth.json: $(SCENE_DEPTH)/moge_inference.json $(PRIMARY_
 
 $(DA3_DEPTH)/candidate.json: $(POSE)/summary.json
 	@$(call stage,DA3 depth)
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.da3 $(SEQ) --colmap-model $(MODEL) --output-dir $(DA3_DEPTH) --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES) $(MODEL_IMAGES_ARG)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.da3 $(SEQ) --colmap-model $(MODEL) --output-dir $(DA3_DEPTH) --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES) $(MODEL_IMAGES_ARG) $(DA3_ARGS)
 
 $(OMEGA_DEPTH)/candidate.json: $(POSE)/summary.json recon/depth/multiview/omega.py
 	@$(call stage,VGGT-Omega depth)
@@ -380,7 +388,7 @@ $(PATCHMATCH_DEPTH)/candidate.json: $(POSE)/summary.json recon/depth/multiview/p
 
 $(FUSED_DEPTH)/hybrid_depth.json: $(HYBRID_DEPTH)/hybrid_depth.json $(DA3_DEPTH)/candidate.json $(OMEGA_DEP) $(PATCHMATCH_DEP) recon/depth/fusion/filter.py
 	@$(call stage,Photometric fusion)
-	$(Q)$(GPU) $(PYTHON) -m recon.depth.fusion.filter --model $(MODEL) --masks-dir $(MASKS) --base-depth $(HYBRID_DEPTH) --images $(FUSION_IMAGES) --candidate $(DEPTH_MODEL) $(PRIMARY_DEPTH) 0 --candidate da3 $(DA3_DEPTH) 0 $(OMEGA_CANDIDATE) $(PATCHMATCH_CANDIDATE) --output-dir $(FUSED_DEPTH)
+	$(Q)$(GPU) $(PYTHON) -m recon.depth.fusion.filter --model $(MODEL) --masks-dir $(MASKS) --base-depth $(HYBRID_DEPTH) --images $(FUSION_IMAGES) --candidate $(DEPTH_MODEL) $(PRIMARY_DEPTH) 0 --candidate da3 $(DA3_DEPTH) 0 $(OMEGA_CANDIDATE) $(PATCHMATCH_CANDIDATE) --output-dir $(FUSED_DEPTH) $(FUSION_ARGS)
 
 $(REFINED_FUSED_DEPTH)/hybrid_depth.json: $(REFINE_INPUT)/hybrid_depth.json recon/depth/fusion/refine.py
 	@$(call stage,Photometric refinement)

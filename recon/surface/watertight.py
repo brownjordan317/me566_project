@@ -63,38 +63,6 @@ def carve_hull(a, low: np.ndarray, shape: np.ndarray, voxel: float, device: str)
     return inside.reshape(tuple(shape)).cpu().numpy()
 
 
-def carve_free_space(a, low: np.ndarray, shape: np.ndarray, voxel: float, device: str,
-                    margin: float) -> np.ndarray:
-    """Voxels some view saw through: nearer than its observed surface by more than `margin`.
-
-    Silhouettes alone cannot carve a concavity, because a cavity that is only visible by looking into it
-    still projects inside the object's outline from every direction; the visual hull therefore fills it
-    (an open-top car's cockpit, convertible: official F1 55.4 -> 16.5 with the hull alone). Depth knows
-    better: the space between a camera and the surface it measured is empty whatever the silhouette says.
-    """
-    intrinsics, poses = frame_intrinsics(a.model), load_poses(a.trajectory)
-    points = grid_points(low, shape, voxel, device)
-    free = torch.zeros(len(points), dtype=torch.bool, device=device)
-    for frame, (rotation, centre) in sorted(poses.items()):
-        depth_file = a.depth_dir / f'{frame:08d}_grounded.npy'
-        if frame not in intrinsics or not depth_file.is_file():
-            continue
-        depth = np.load(depth_file).astype('float32')
-        K = torch.tensor(intrinsics[frame], dtype=torch.float32, device=device)
-        R = torch.tensor(rotation, dtype=torch.float32, device=device)
-        t = torch.tensor(centre, dtype=torch.float32, device=device)
-        camera = (points - t) @ R
-        z = camera[:, 2]
-        height, width = depth.shape
-        u = (K[0, 0] * camera[:, 0] / z.clamp(min=1e-6) + K[0, 2]).round().long()
-        v = (K[1, 1] * camera[:, 1] / z.clamp(min=1e-6) + K[1, 2]).round().long()
-        in_view = (z > 1e-6) & (u >= 0) & (u < width) & (v >= 0) & (v < height)
-        flat = torch.where(in_view, v * width + u, torch.zeros_like(u))
-        observed = torch.tensor(depth.reshape(-1), device=device)[flat]
-        free |= in_view & (observed > 0) & (z < observed - margin)
-    return free.reshape(tuple(shape)).cpu().numpy()
-
-
 def tidy_field(occupancy: np.ndarray) -> np.ndarray:
     """Largest blob with thin necks closed, so the level set cannot pick up specks or pinch points."""
     labels, count = ndimage.label(occupancy)
@@ -144,11 +112,7 @@ def close_by_winding(a) -> None:
     band = a.band * voxel
     device = a.device if torch.cuda.is_available() else 'cpu'
     with spinner('Carving the visual hull'):
-        occupancy = carve_hull(a, low, shape, voxel, device)
-    if a.depth_dir is not None:
-        with spinner('Carving free space from depth'):
-            occupancy &= ~carve_free_space(a, low, shape, voxel, device, a.free_margin * voxel)
-    occupancy = tidy_field(occupancy)
+        occupancy = tidy_field(carve_hull(a, low, shape, voxel, device))
     query = grid_points(low, shape, voxel, 'cpu').numpy().astype(np.float64)
     winding = np.empty(len(query))
     with spinner(f'Winding number at {len(query):,} points'):
@@ -183,8 +147,6 @@ def close_by_winding(a) -> None:
     deep = interior_mask & (np.abs(distance) > band if a.signed_distance else np.ones(len(query), bool))
     threshold = a.threshold
     interior = float(np.median(winding[deep])) if deep.sum() > 100 else float('nan')
-    if a.adaptive_threshold and deep.sum() > 100:
-        threshold = max(a.min_threshold, a.threshold_fraction * interior)
     # The whole method rests on the winding number separating inside from outside, and that separation
     # weakens as the input mesh gets more open: measured interior values are 0.69 (audi, jeep), 0.51
     # (satellite), 0.42 (convertible), 0.14 (big_ben). Below about 0.5 the field smears, the sign goes
@@ -224,7 +186,7 @@ def close_by_winding(a) -> None:
     if not o3d.io.write_triangle_mesh(str(a.output), closed):
         raise OSError(a.output)
     report = {'source': str(a.mesh), 'voxel': voxel, 'grid': shape.tolist(), 'threshold': a.threshold,
-              'hull_voxels_pct': float(occupancy.mean() * 100), 'depth_carved': a.depth_dir is not None,
+              'hull_voxels_pct': float(occupancy.mean() * 100), 
               'inside_voxels_pct': float((winding > threshold).mean() * 100), 'threshold_used': threshold,
               'interior_winding': interior, 'orientation_flipped': bool(flipped),
               'winding_at_centroid': interior,
@@ -253,11 +215,6 @@ def main() -> None:
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--resolution', type=int, default=320, help='Voxels across the longest side')
     p.add_argument('--pad', type=float, default=.08, help='Fraction of the extent added as free space')
-    p.add_argument('--depth-dir', type=Path,
-                   help='<frame>_grounded.npy; carves space seen through, which silhouettes cannot do '
-                        '(concavities such as an open-top car\'s cockpit)')
-    p.add_argument('--free-margin', type=float, default=1.5,
-                   help='Voxels of slack before depth counts a voxel as free, so the surface is not eaten')
     p.add_argument('--signed-distance', action=argparse.BooleanOptionalAction, default=True,
                    help='Use the signed distance to the mesh (zero set on the triangles) rather than the '
                         'winding-number indicator, whose level set sits up to half a voxel off')
@@ -266,13 +223,6 @@ def main() -> None:
     p.add_argument('--require-interior', type=float, default=.5,
                    help='Refuse to close when the measured interior winding is below this, where the '
                         'method degrades into a blob; 0 disables the check')
-    p.add_argument('--adaptive-threshold', action=argparse.BooleanOptionalAction, default=True,
-                   help='Calibrate the inside threshold from the winding number deep inside the hull, '
-                        'instead of assuming the 0.5 that only holds for a nearly closed surface')
-    p.add_argument('--threshold-fraction', type=float, default=.5,
-                   help='Fraction of the measured interior winding counted as inside')
-    p.add_argument('--min-threshold', type=float, default=.05,
-                   help='Floor on the calibrated threshold, so noise cannot make everything inside')
     p.add_argument('--threshold', type=float, default=.5,
                    help='Winding number counted as inside; below 0.5 closes larger openings more boldly')
     p.add_argument('--blur', type=float, default=.6, help='Smoothing of the indicator, in voxels')

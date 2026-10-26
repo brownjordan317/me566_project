@@ -23,6 +23,8 @@ import json
 from pathlib import Path
 
 import cv2
+import warnings
+
 import numpy as np
 import torch
 
@@ -47,6 +49,9 @@ def main() -> None:
     p.add_argument('--radius', type=int, default=4, help='Patch radius in full-resolution pixels')
     p.add_argument('--stride', type=int, default=2, help='Score every STRIDE-th working pixel')
     p.add_argument('--window', type=int, default=17, help='Pooling window in working pixels')
+    p.add_argument('--combine', choices=('score', 'mean', 'median'), default='score',
+                   help="How to settle on a depth per pixel: the pooled patch score's winner (default), or "
+                        'the candidates averaged or their median, which need no photometric comparison')
     p.add_argument('--device', default='cuda')
     a = p.parse_args()
     device = a.device
@@ -98,7 +103,23 @@ def main() -> None:
             ordered = np.sort(ranked, axis=0)
             margin = np.where(np.isfinite(ordered[-2]), ordered[-1] - ordered[-2], 0)
             object_pixels = mask & np.isfinite(ranked.max(0))
-            chosen = np.take_along_axis(stack, choice[None], 0)[0]
+            if a.combine == 'score':
+                chosen = np.take_along_axis(stack, choice[None], 0)[0]
+            else:
+                # Photometry-free alternatives, for captures whose neighbours are too far apart for the
+                # patch score to mean much: combine the candidates instead of choosing between them.
+                covered = present.sum(0)
+                if a.combine == 'mean':
+                    # Summed and divided explicitly: nanmean warns on every pixel no candidate covers.
+                    chosen = (np.where(present, stack, 0).sum(0)
+                              / np.maximum(covered, 1)).astype(np.float32)
+                else:
+                    candidates = np.where(present, stack, np.nan)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore', RuntimeWarning)   # all-NaN pixels
+                        chosen = np.nanmedian(candidates, 0).astype(np.float32)
+                chosen = np.where((covered > 0) & np.isfinite(chosen), chosen, 0)
+                object_pixels = mask & (chosen > 0)
             fused = np.where(mask, 0, base).astype(np.float32)
             fused[object_pixels] = chosen[object_pixels]
             confidence = np.where(object_pixels, margin, 0).astype(np.float32)

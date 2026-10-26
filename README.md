@@ -143,6 +143,12 @@ The closed mesh is decimated to `ASSET_MAX_FACES` (100,000) before texturing, be
 times the open mesh's faces and a fixed atlas then spreads too thin: at 100k the texture is 13% sharper
 than at 300k for 0.75 points more unpainted surface. Raise it for coverage, lower it for detail.
 
+Every texel's origin is recorded beside the asset in `asset_source.png` (0 unpainted, 1 photographed,
+2 mirrored, 3 rendered) and summarised in `asset.json`, because a filled texel is inferred rather than
+observed. On a closed motorcycle asset 82% of the texture is photographed, 16% rendered from the fitted
+Gaussians and 2% mirrored; judge accuracy on the photographed share. `--mirror-fill` adds the mirroring
+step, which helps little on an asymmetric object and costs some sharpness, so it is off by default.
+
 Both stages need the gsplat environment (`make setup-gaussian`) and libigl; see
 [docs/PIPELINE.md](docs/PIPELINE.md) for the methods that did not work, including hole filling and
 Poisson reconstruction, which both leave the mesh open.
@@ -270,6 +276,7 @@ This project's own code may be released openly. Its default pipeline also uses m
 | SAM-HQ | Optional mask refinement | Apache-2.0 | — |
 | gsplat | Planar-Gaussian refinement (`make refine-gaussian`, optional second pass, own environment) | Apache-2.0 | — |
 | libigl | Watertight closure (`make watertight`, generalised winding number) | MPL-2.0 | — |
+| xatlas | UV unwrapping for textured meshes (`recon/surface/texture.py`) | MIT | — |
 | Open3D, PyTorch, SciPy, rich, tqdm, halo | Fusion, utilities | MIT / BSD | — |
 | MASt3R, VGGT-Ω, DA3-Large/Giant, 2DGS, PGSR (`recon/evaluation/baselines`) | Comparisons only | Non-commercial (2DGS: Gaussian-Splatting License; PGSR: research and non-profit use only) | — |
 

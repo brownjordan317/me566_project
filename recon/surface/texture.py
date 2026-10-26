@@ -29,6 +29,75 @@ from recon.common.progress import done, spinner
 from recon.common.trajectory import load_poses
 
 
+def texel_points(vertices: np.ndarray, faces: np.ndarray, uvs: np.ndarray,
+                 size: int) -> tuple[np.ndarray, np.ndarray]:
+    """The surface point behind each texel, by rasterising the UV triangles.
+
+    Returned as a (size, size, 3) array of positions and a mask of which texels a triangle covers.
+    """
+    points = np.zeros((size, size, 3), np.float32)
+    covered = np.zeros((size, size), bool)
+    pixel = uvs.copy()
+    pixel[:, 0] *= size - 1
+    pixel[:, 1] = (1 - pixel[:, 1]) * (size - 1)
+    for triangle in faces:
+        uv = pixel[triangle]
+        low = np.floor(uv.min(0)).astype(int)
+        high = np.ceil(uv.max(0)).astype(int)
+        low = np.maximum(low, 0)
+        high = np.minimum(high, size - 1)
+        if np.any(high < low):
+            continue
+        xs = np.arange(low[0], high[0] + 1)
+        ys = np.arange(low[1], high[1] + 1)
+        grid = np.stack(np.meshgrid(xs, ys, indexing='xy'), -1).reshape(-1, 2).astype(np.float32)
+        a0, b0, c0 = uv
+        cross = lambda p, q: p[..., 0] * q[..., 1] - p[..., 1] * q[..., 0]   # NumPy 2 dropped 2-D cross
+        area = float(cross(b0 - a0, c0 - a0))
+        if abs(area) < 1e-9:
+            continue
+        w0 = cross(b0 - a0, grid - a0) / area
+        w1 = cross(grid - a0, c0 - a0) / area
+        inside = (w0 >= -.002) & (w1 >= -.002) & (w0 + w1 <= 1.002)
+        if not inside.any():
+            continue
+        picked = grid[inside].astype(int)
+        bary = np.stack([1 - w0[inside] - w1[inside], w1[inside], w0[inside]], 1)
+        points[picked[:, 1], picked[:, 0]] = bary @ vertices[triangle]
+        covered[picked[:, 1], picked[:, 0]] = True
+    return points, covered
+
+
+def mirror_texels(albedo: np.ndarray, blank: np.ndarray, vertices: np.ndarray, faces: np.ndarray,
+                  uvs: np.ndarray, blank_level: float) -> tuple[np.ndarray, float]:
+    """Fill unpainted texels from their mirror-symmetric partner, where that partner was painted."""
+    from scipy.spatial import cKDTree
+    size = albedo.shape[0]
+    points, covered = texel_points(vertices, faces, uvs, size)
+    target = blank & covered
+    painted = covered & ~blank
+    if not target.any() or not painted.any():
+        return albedo, 0.
+    centroid = vertices.mean(0)
+    _, _, axes = np.linalg.svd(vertices - centroid, full_matrices=False)
+    source = points[painted]
+    tree = cKDTree(source)
+    colours = albedo[painted]
+    best = None
+    for axis in axes:                                   # the axis whose reflection lands closest wins
+        reflected = points[target] - 2 * np.outer((points[target] - centroid) @ axis, axis)
+        distance, index = tree.query(reflected, workers=-1)
+        if best is None or np.median(distance) < best[0]:
+            best = (float(np.median(distance)), distance, index)
+    _, distance, index = best
+    extent = float(np.linalg.norm(vertices.max(0) - vertices.min(0)))
+    close = distance < .01 * extent                     # only where the mirror really lands on surface
+    filled = albedo.copy()
+    rows, cols = np.nonzero(target)
+    filled[rows[close], cols[close]] = colours[index[close]]
+    return filled, close.sum() / max(1, covered.sum())
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('mesh', type=Path)
@@ -40,6 +109,12 @@ def main() -> None:
     p.add_argument('--output', type=Path, required=True, help='.glb file')
     p.add_argument('--frames', type=int, default=24, help='Frames projected, spread over the sequence')
     p.add_argument('--texture-size', type=int, default=4096)
+    p.add_argument('--provenance-map', action=argparse.BooleanOptionalAction, default=True,
+                   help='Write <output>_source.png: per texel, 0 unpainted, 1 photographed, 2 mirrored, '
+                        '3 rendered, so inferred colour is never mistaken for observed')
+    p.add_argument('--mirror-fill', action=argparse.BooleanOptionalAction, default=False,
+                   help="Fill unpainted texels from their mirror-symmetric partner's photographed colour "
+                        'before falling back to renders; most scanned objects are largely symmetric')
     p.add_argument('--fill-views', type=Path,
                    help='recon.surface.splat_views output; its renders fill texels the photos leave blank')
     p.add_argument('--fill-frames', type=int, default=48, help='Rendered views projected for the filling')
@@ -129,7 +204,22 @@ def main() -> None:
         return albedo.copy(), picked, target
 
     albedo, chosen, mesh = project(a.images, a.model, a.trajectory, a.frames, a.sequence)
-    filled = None
+    filled = mirrored = None
+    # Provenance, so nothing synthetic can be mistaken for evidence: 1 photographed, 2 mirrored from a
+    # photographed counterpart, 3 rendered from the fitted Gaussians (plausible, not observed), 0 unpainted.
+    PHOTO, MIRROR, RENDER = 1, 2, 3
+    source = np.where(albedo[..., :3].mean(-1) < a.blank_level, 0, PHOTO).astype(np.uint8)
+    if a.mirror_fill:
+        # Photographed colour, reflected, beats anything synthetic: these objects are largely symmetric,
+        # and a third to two thirds of the surface no view saw has a mirror counterpart that was seen
+        # (recon/evaluation/diagnostics/headroom.py). So unpainted texels take their partner's colour
+        # before the renders are consulted at all.
+        blank = albedo[..., :3].mean(-1) < a.blank_level
+        with spinner('Mirroring photographed colour into unpainted texels'):
+            before = albedo[..., :3].mean(-1) < a.blank_level
+            albedo, share = mirror_texels(albedo, blank, vertices, faces, uvs, a.blank_level)
+            source[before & (albedo[..., :3].mean(-1) >= a.blank_level)] = MIRROR
+        mirrored = {'share_of_texture_pct': float(share * 100)}
     if a.fill_views is not None:
         # The photos leave surface blank wherever they only see it at a grazing angle or not at all: on
         # jeep 8% of on-surface texels against the 1.1% no view observed. Renders of the fitted Gaussians
@@ -141,13 +231,26 @@ def main() -> None:
         # One texel of dilation puts the seam inside the filled region rather than on its boundary.
         blank = cv2.dilate(blank.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
         albedo[blank] = fill[blank]
+        source[blank & (albedo[..., :3].mean(-1) >= a.blank_level)] = RENDER
         filled = {'views': fill_frames, 'share_of_texture_pct': float(blank.mean() * 100)}
         mesh.material.texture_maps['albedo'] = o3d.t.geometry.Image(np.ascontiguousarray(albedo))
     a.output.parent.mkdir(parents=True, exist_ok=True)
     if not o3d.t.io.write_triangle_mesh(str(a.output), mesh):
         raise OSError(a.output)
+    painted = source > 0
+    provenance = {name: float((source[painted] == value).mean() * 100) if painted.any() else 0.
+                  for name, value in (('photographed_pct', PHOTO), ('mirrored_pct', MIRROR),
+                                      ('rendered_pct', RENDER))}
+    if a.provenance_map:
+        # Written beside the asset rather than into it: a viewer shows the albedo, and this says which of
+        # it is evidence. 0 unpainted, 1 photographed, 2 mirrored, 3 rendered.
+        cv2.imwrite(str(a.output.with_name(a.output.stem + '_source.png')), source)
     report = {'faces': len(legacy.triangles), 'frames': chosen, 'texture_size': a.texture_size,
-              'filled_from_renders': filled}
+              'texture_provenance': provenance,
+              'disclaimer': 'Texels marked mirrored or rendered in the *_source.png map are inferred, not '
+                            'observed: no view photographed that surface. Judge accuracy on the '
+                            'photographed share only.',
+              'filled_from_renders': filled, 'filled_from_mirror': mirrored}
     a.output.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')
     done(f'Texture: {len(chosen)} photos onto {len(legacy.triangles):,} faces -> {a.output.name}')
 
