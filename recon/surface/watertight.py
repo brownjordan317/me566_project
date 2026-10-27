@@ -136,7 +136,7 @@ def close_by_winding(a) -> None:
                     query[start:start + a.chunk], vertices, faces,
                     igl.SIGNED_DISTANCE_TYPE_FAST_WINDING_NUMBER)[0]
     # The winding number inside an *open* surface is 1 minus the openings' solid angle, which varies by
-    # scene: 0.69 for audi and jeep, 0.51 satellite, 0.42 convertible, 0.14 big_ben. A fixed 0.5 therefore
+    # scene: measured over all 18 (2026-10-26) it runs 0.23 (castle, bridge) to 0.85 (cabin). A fixed 0.5 therefore
     # finds nothing inside the more open meshes and the closure collapses onto the bare hull (convertible:
     # official F1 55.4 -> 16.5). So the threshold is calibrated per scene from the winding number deep
     # inside the hull, far from any surface, where the field is whatever "inside" means for this mesh.
@@ -147,17 +147,22 @@ def close_by_winding(a) -> None:
     deep = interior_mask & (np.abs(distance) > band if a.signed_distance else np.ones(len(query), bool))
     threshold = a.threshold
     interior = float(np.median(winding[deep])) if deep.sum() > 100 else float('nan')
-    # The whole method rests on the winding number separating inside from outside, and that separation
-    # weakens as the input mesh gets more open: measured interior values are 0.69 (audi, jeep), 0.51
-    # (satellite), 0.42 (convertible), 0.14 (big_ben). Below about 0.5 the field smears, the sign goes
+    # The whole method rests on the winding number separating inside from outside. Measured on all 18
+    # scenes of the current pipeline (docs/PIPELINE.md): castle 0.230, bridge 0.232, convertible 0.236,
+    # boat 0.289, colosseum 0.333, ferrari 0.392, porsche 0.432 fall below the gate; audi 0.577 through
+    # cabin 0.848 pass. Below about 0.5 the field smears, the sign goes
     # wrong over whole regions and the output is a blob, not a surface - convertible's official F1 falls
     # 55.4 -> 16.5 and its chamfer rises 6.7 -> 24.6 mm, the same from four different variants of the
     # closure, so it is the winding number itself and not the clamp, threshold or carving. Refusing is
     # the honest behaviour: an open mesh beats a closed blob.
-    if a.require_interior > 0 and interior == interior and interior < a.require_interior:
+    # An unmeasurable interior (too few deep voxels to take a median over) used to pass the gate, because
+    # the NaN failed the comparison: `interior == interior` is False, so a mesh whose inside could not be
+    # found at all was closed anyway. That is the one case where the blob is most likely, so it refuses.
+    if a.require_interior > 0 and not interior >= a.require_interior:
+        measured = 'could not be measured' if interior != interior else f'is {interior:.3f}'
         raise SystemExit(
             f'Refusing to close {a.mesh}: the mesh is too open for its winding number to separate inside '
-            f'from outside (interior winding {interior:.3f} < {a.require_interior}). Closing it would '
+            f'from outside (interior winding {measured}, against {a.require_interior}). Closing it would '
             f'produce a solid blob rather than a surface. Pass --require-interior 0 to override.')
     # A winding-number indicator only localises the surface to half a voxel, and smoothing blurs it
     # further; a true signed distance puts its zero set on the triangles themselves, and trilinear

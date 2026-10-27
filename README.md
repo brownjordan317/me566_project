@@ -153,6 +153,24 @@ Both stages need the gsplat environment (`make setup-gaussian`) and libigl; see
 [docs/PIPELINE.md](docs/PIPELINE.md) for the methods that did not work, including hole filling and
 Poisson reconstruction, which both leave the mesh open.
 
+## Scene-first with 3D segmentation (`make segment`, experimental)
+
+Reconstruct the whole scene with **no masks**, then cut the object out in 3D. The masks become supervision
+for labelling the fitted Gaussians instead of deciding which pixels every stage may use, so a mask that
+clips the object in one frame is outvoted by the others rather than deleting that surface.
+
+```bash
+# white masks in a copy of the sequence, scene TSDF for the object, the optimiser on top
+make refine-gaussian SCENE=jeep SEQ_ROOT=<white-mask sequences> RUN=runs/real/jeep_sf OBJECT_TSDF=scene KEEP_INTERMEDIATE=1
+make segment         SCENE=jeep SEQ_ROOT=<white-mask sequences> RUN=runs/real/jeep_sf OBJECT_TSDF=scene SEGMENT_MASKS=<real masks>
+```
+
+The cut (`recon/surface/segment.py`) labels every Gaussian in closed form — the rendered mask is linear in
+the labels, so the optimum decouples per Gaussian (after FlashSplat, reimplemented) — in a few seconds on
+the existing fit, and writes `mesh/object_segmented.ply`. Not the default: across the four development
+scenes it averages about +0.3 official F1 over a same-day masked run, with the strict F@1 netting to zero
+and big_ben losing thin surface for a reason not yet found (docs/PIPELINE.md).
+
 ## Reconstruct your own capture
 
 For a folder of JPG or PNG images, or a video:

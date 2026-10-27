@@ -16,7 +16,7 @@ import torch
 
 from recon.common.colmap import parse_model
 from recon.common.progress import bar, done, spinner
-from recon.depth.grounding import fit_metric_depth, object_anchors, point_table
+from recon.depth.grounding import fit_regionwise, object_anchors, point_table
 
 
 def main():
@@ -27,6 +27,10 @@ def main():
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--checkpoint', type=Path,
                         help='Local checkpoint; defaults to the cached MoGe-3 ViT-L weights')
+    parser.add_argument('--grounding-regions', type=int, default=1,
+                        help='Affine-fit the depth in this many regions of position and '
+                             'predicted depth, blended across the image, instead of one '
+                             'global fit per frame (1 keeps the global fit)')
     parser.add_argument('--num-tokens', type=int, default=2500)
     parser.add_argument('--version', choices=('v2', 'v3'), default='v3')
     parser.add_argument('--refine-steps', type=int, default=3)
@@ -123,7 +127,7 @@ def main():
         try:
             coords, target = object_anchors(observations, points, rotation,
                                             translation, anchor_mask)
-            grounded, report = fit_metric_depth(raw, coords, target)
+            grounded, report = fit_regionwise(raw, coords, target, args.grounding_regions)
             rejected = report['scale_share'] < args.min_scale_share
         except ValueError as error:
             # Too few sparse points to ground this frame: drop it like a

@@ -19,7 +19,7 @@ import torch
 
 from recon.common.colmap import parse_model
 from recon.common.progress import bar, done, spinner
-from recon.depth.grounding import object_anchors, fit_metric_depth
+from recon.depth.grounding import object_anchors, fit_regionwise
 
 
 def unpad_depth(depth: np.ndarray, original_shape: tuple[int, int]) -> np.ndarray:
@@ -52,6 +52,8 @@ def main() -> None:
     p.add_argument('sequence', type=Path)
     p.add_argument('--model', type=Path, required=True,
                    help='Registered COLMAP sparse_txt model')
+    p.add_argument('--grounding-regions', type=int, default=1,
+                   help='Affine-fit the depth in this many regions of position and predicted depth, blended across the image, instead of one global fit per frame (1 keeps the global fit)')
     p.add_argument('--output-dir', type=Path, required=True)
     p.add_argument('--checkpoint-dir', type=Path,
                    help='Local Hugging Face VGGT-1B snapshot; default cached model')
@@ -118,7 +120,7 @@ def main() -> None:
             try:
                 coords, target = object_anchors(observations, points,
                                                 rotation, translation, mask)
-                grounded, fit = fit_metric_depth(depth, coords, target)
+                grounded, fit = fit_regionwise(depth, coords, target, args.grounding_regions)
                 if fit['scale_share'] < .5:
                     raise ValueError(f'Degenerate depth fit: {fit["scale_share"]:.3f}')
             except ValueError as error:

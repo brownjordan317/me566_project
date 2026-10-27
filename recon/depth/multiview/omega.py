@@ -35,6 +35,8 @@ def main() -> None:
     p.add_argument('--resize-mode', choices=('balanced', 'max_size'), default='balanced')
     p.add_argument('--window', type=int, default=128)
     p.add_argument('--step', type=int, default=64)
+    p.add_argument('--grounding-regions', type=int, default=1,
+                   help='Affine-fit the depth in this many regions of position and predicted depth, blended across the image, instead of one global fit per frame (1 keeps the global fit)')
     p.add_argument('--max-relative-error', type=float, default=.03)
     p.add_argument('--images', type=Path,
                    help='Full-resolution photos (numbered files) to feed the model instead of the working frames')
@@ -82,7 +84,7 @@ def main() -> None:
                 prediction = cv2.resize(depth[slot], (width, height), interpolation=cv2.INTER_LINEAR)
                 coords, target = anchors[i]
                 try:
-                    grounded, report = ground(prediction, 'depth', coords, target)
+                    grounded, report = ground(prediction, 'depth', coords, target, a.grounding_regions)
                 except ValueError:
                     continue
                 if report['relative_anchor_error'] <= a.max_relative_error:
@@ -97,7 +99,7 @@ def main() -> None:
             if not counts[i]:
                 raise ValueError('No valid grounded window')
             coords, target = anchors[i]
-            grounded, report = ground(sums[i] / counts[i], 'depth', coords, target)
+            grounded, report = ground(sums[i] / counts[i], 'depth', coords, target, a.grounding_regions)
             rejected = report['relative_anchor_error'] > a.max_relative_error
         except ValueError as error:
             report, rejected = {'reason': str(error)}, True

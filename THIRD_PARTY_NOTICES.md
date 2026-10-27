@@ -8,7 +8,12 @@ their own licences in `third_party/` or their packages; see the README's
 "Licences of components" and "Credits and citations" sections.
 
 `recon/depth/gaussian_refine.py` is not listed below: it reimplements PGSR's published method from the
-paper and contains none of its code, as its docstring records. The methods the newer stages call are
+paper and contains none of its code, as its docstring records. The same applies to the two segmentation
+methods it now carries, both reimplemented from their papers with none of their code: the per-Gaussian
+identity feature supervised by 2D masks (Gaussian Grouping, Ye et al. 2024; SAGA, Cen et al. 2023) in
+`render_labels`, and the closed-form optimal label assignment in `solve_labels` (FlashSplat, Shen et al.,
+ECCV 2024, whose own release is under the research-only Gaussian-Splatting licence, so none of it is used
+or vendored here). The methods the newer stages call are
 credited where they are used - the generalised winding number (Jacobson et al., SIGGRAPH 2013; Barill et
 al., SIGGRAPH 2018) through libigl in `recon/surface/watertight.py`, shape from silhouette (Laurentini,
 TPAMI 1994) for the visual hull there, and xatlas for UV unwrapping in `recon/surface/texture.py`.

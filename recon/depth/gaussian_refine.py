@@ -76,7 +76,8 @@ def quaternion_from_normal(normals: np.ndarray) -> np.ndarray:
 class Views:
     """Our cameras and photos on the GPU."""
 
-    def __init__(self, sequence: Path, model: Path, device: str, principal_shift: float = 0.):
+    def __init__(self, sequence: Path, model: Path, device: str, principal_shift: float = 0.,
+                 masks: Path | None = None):
         intrinsics, _, frames = parse_model(model)
         self.numbers = [number for number, *_ in frames]
         self.K = torch.tensor(np.stack([intrinsics[n] for n in self.numbers]), dtype=torch.float32, device=device)
@@ -96,6 +97,12 @@ class Views:
         self.images = torch.stack(images).permute(0, 3, 1, 2).float() / 255             # (N, 3, H, W)
         self.gray = self.images.mean(1)                                                 # (N, H, W)
         self.height, self.width = self.images.shape[-2:]
+        self.masks = None
+        if masks is not None:
+            layers = [cv2.imread(str(masks / f'{number:08d}.png'), cv2.IMREAD_GRAYSCALE) for number in self.numbers]
+            if any(layer is None for layer in layers):
+                raise FileNotFoundError(f'A mask is missing from {masks}')
+            self.masks = (torch.tensor(np.stack(layers), device=device).float() / 255 > .5).float()   # (N, H, W)
         centres = -np.einsum('nji,nj->ni', self.rotations, self.translations)
         self.radius = 1.1 * float(np.max(np.linalg.norm(centres - centres.mean(0), axis=1)))
         self._scaled = {1.: self.gray}
@@ -133,6 +140,11 @@ class Gaussians(torch.nn.Module):
         self.sh0 = t(((np.clip(rgb, .02, .98) - .5) / SH_C0)[:, None, :])
         self.shN = t(np.zeros((len(xyz), 15, 3)))
         self.sh_degree = 0
+        # One foreground logit per Gaussian, supervised by the 2D masks and composited like colour
+        # (the identity-feature idea of Gaussian Grouping, Ye et al. 2024, and SAGA, Cen et al. 2023;
+        # implemented here rather than ported). It is a read-out: the label render detaches the geometry,
+        # so no mask can move a surfel and the reconstruction stays exactly what it would be without it.
+        self.labels = t(np.zeros((len(xyz), 1)))
 
     export = 'median'
 
@@ -143,6 +155,23 @@ class Gaussians(torch.nn.Module):
                                   torch.sigmoid(self.opacities), colors, views.viewmats[index],
                                   views.K[index], views.width, views.height, render_mode=mode,
                                   sh_degree=self.sh_degree)
+
+    def render_labels(self, views: Views, index: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Alpha-composite the foreground probability, with the geometry held fixed.
+
+        Occlusion is the reason this beats a visual hull: the rasteriser decides which Gaussian each
+        pixel sees, so a surfel on the table is supervised as background in the views that see it, while
+        one buried under the object receives no gradient instead of being wrongly kept by a silhouette
+        cone that cannot know it is hidden.
+        """
+        from gsplat import rasterization_2dgs
+        rendered, alphas, *_ = rasterization_2dgs(
+            self.means.detach(), F.normalize(self.quats, dim=-1).detach(), torch.exp(self.scales).detach(),
+            torch.sigmoid(self.opacities).detach(),
+            torch.sigmoid(self.labels)[None].expand(len(index), -1, -1),    # features need a camera axis
+            views.viewmats[index],
+            views.K[index], views.width, views.height, render_mode='RGB', sh_degree=None)
+        return rendered[..., 0], alphas[..., 0]
 
     def forward(self, views: Views, index: int) -> dict:
         colors, alphas, normals, surf_normals, _, _, meta = self.render(views, [index])
@@ -179,6 +208,9 @@ def load_gaussians(path: Path, device: str, center=np.zeros(3), radius: float = 
     gaussians.opacities = t(column('opacity')[:, 0])
     gaussians.sh0, gaussians.shN = t(column('f_dc_0', 'f_dc_1', 'f_dc_2')[:, None]), t(rest)
     gaussians.sh_degree, gaussians.flat_weight = 3, 100.
+    # __init__ is bypassed above, so the label logit it creates has to be made here too, or a loaded
+    # file cannot be segmented (solve_labels on it would fail on the missing attribute).
+    gaussians.labels = t(np.zeros((len(gaussians.means), 1)))
     return gaussians
 
 
@@ -287,7 +319,38 @@ class Gaussians3D(Gaussians):
 
 
 SH_C0 = 0.28209479177387814
-NAMES = ('means', 'quats', 'scales', 'opacities', 'sh0', 'shN')
+NAMES = ('means', 'quats', 'scales', 'opacities', 'sh0', 'shN', 'labels')   # order matches the optimiser's
+# param groups, which rebuild() zips against: a parameter missing here survives densification at its old
+# length and the rasteriser then rejects it against the new Gaussian count.
+
+
+def solve_labels(gaussians: 'Gaussians', views: Views, bias: float = 1.) -> torch.Tensor:
+    """Assign each Gaussian a foreground label in closed form, instead of fitting one by gradient descent.
+
+    FlashSplat's observation (Shen et al., ECCV 2024, "2D to 3D Gaussian Splatting Segmentation Solved
+    Optimally"; formulation reimplemented here, none of its code used): the rendered mask is a *linear*
+    function of the per-Gaussian labels, so the optimal binary assignment decouples - a Gaussian belongs
+    to the object when its alpha-blending weight accumulated over foreground pixels exceeds its weight
+    over background pixels, scaled by a bias that trades precision for recall.
+
+    Those accumulated weights need no change to the rasteriser: rendering R = sum_i w_i l_i makes dR/dl_i
+    exactly the blending weight w_i, so one backward pass of sum_pixels (mask - bias (1 - mask)) R per view
+    yields the whole decision statistic, summed over views as the gradient accumulates. The sigmoid on the
+    labels only multiplies each Gaussian's gradient by a positive constant, which cannot change the sign,
+    so the existing render is reused unaltered.
+    """
+    if views.masks is None:
+        raise ValueError('solve_labels needs masks (--labels)')
+    gaussians.labels.grad = None
+    with torch.enable_grad():
+        for index in range(len(views.numbers)):
+            rendered, alpha = gaussians.render_labels(views, [index])
+            mask = views.masks[index]
+            weight = torch.where(mask > .5, torch.ones_like(mask), -float(bias) * torch.ones_like(mask))
+            (rendered[0] * weight * (alpha[0] > .01)).sum().backward()
+    statistic = gaussians.labels.grad[:, 0].clone()
+    gaussians.labels.grad = None
+    return (statistic > 0).float()
 
 
 def rebuild(gaussians: 'Gaussians', optimiser: torch.optim.Adam, keep: torch.Tensor, added: dict | None = None) -> None:
@@ -326,7 +389,8 @@ def densify(gaussians: 'Gaussians', optimiser: torch.optim.Adam, gradient: torch
                  'scales': torch.cat([gaussians.scales[large] - math.log(1.6)] * 2 + [gaussians.scales[small]]),
                  'opacities': torch.cat([gaussians.opacities[large]] * 2 + [gaussians.opacities[small]]),
                  'sh0': torch.cat([gaussians.sh0[large]] * 2 + [gaussians.sh0[small]]),
-                 'shN': torch.cat([gaussians.shN[large]] * 2 + [gaussians.shN[small]])}
+                 'shN': torch.cat([gaussians.shN[large]] * 2 + [gaussians.shN[small]]),
+                 'labels': torch.cat([gaussians.labels[large]] * 2 + [gaussians.labels[small]])}
         keep = ~large & (torch.sigmoid(gaussians.opacities) > min_opacity)
         pruned = int((~keep).sum()) - int(large.sum())
     rebuild(gaussians, optimiser, keep, added)
@@ -596,6 +660,18 @@ def main() -> None:
     p.add_argument('--prior', nargs=2, action='append', default=[], metavar=('NAME', 'DIR'),
                    help='A depth source kept as a gated prior (repeat for several)')
     p.add_argument('--prior-weight', type=float, default=0.)
+    p.add_argument('--labels', type=Path,
+                   help='Object masks (<frame>.png) to supervise a per-Gaussian foreground label, for 3D '
+                        'segmentation after an unmasked reconstruction; the label never moves the geometry')
+    p.add_argument('--label-weight', type=float, default=.5)
+    p.add_argument('--label-from', type=int, default=500, help='Iteration the label loss starts at')
+    p.add_argument('--export-labels', type=Path, help='Write means and foreground probability as .npz')
+    p.add_argument('--label-solver', choices=('fit', 'closed-form'), default='fit',
+                   help="fit trains the label by cross-entropy; closed-form solves it optimally in one "
+                        "pass per view (FlashSplat's formulation), which needs no label loss at all")
+    p.add_argument('--label-bias', type=float, default=1.,
+                   help='Background weight in the closed-form solve; above 1 demands more foreground '
+                        'evidence (higher precision), below 1 keeps more surface (higher recall)')
     p.add_argument('--prior-sigma', type=float, default=.005, help='Dynamic gate width (relative depth)')
     p.add_argument('--prior-clip', type=float, default=.01, help='Cap on the per-pixel relative difference')
     p.add_argument('--prior-tolerance', type=float, default=.005, help='Static gate: relative agreement across views')
@@ -615,7 +691,7 @@ def main() -> None:
     rng = np.random.default_rng(a.seed)
     device = 'cuda'
     started = time.time()
-    views = Views(a.sequence, a.model, device, a.principal_shift)
+    views = Views(a.sequence, a.model, device, a.principal_shift, a.labels)
     near = neighbours(views.rotations, views.translations, a.neighbours, (10., 35.))
     if a.init_depth is not None:
         parts = [depth_seeds(views, a.init_depth, a.sequence, a.depth_seeds, rng)]
@@ -638,7 +714,8 @@ def main() -> None:
         {'params': [gaussians.means], 'lr': a.position_lr[0] * views.radius, 'name': 'means'},
         {'params': [gaussians.quats], 'lr': 1e-3}, {'params': [gaussians.scales], 'lr': 5e-3},
         {'params': [gaussians.opacities], 'lr': 5e-2}, {'params': [gaussians.sh0], 'lr': 2.5e-3},
-        {'params': [gaussians.shN], 'lr': 2.5e-3 / 20}], eps=1e-15)
+        {'params': [gaussians.shN], 'lr': 2.5e-3 / 20},
+        {'params': [gaussians.labels], 'lr': 5e-2}], eps=1e-15)
     priors = None
     if a.prior and a.prior_weight > 0:
         priors = Priors(views, [(name, Path(directory)) for name, directory in a.prior], near, a.prior_tolerance,
@@ -672,6 +749,15 @@ def main() -> None:
         else:
             normal_loss = (alpha * (1 - (normals_r * surface).sum(-1))).mean()
         loss = rgb_loss + (a.normal_weight if step >= a.normal_from else 0.) * normal_loss + out['regulariser']
+        if views.masks is not None and a.label_weight > 0 and step >= a.label_from:
+            # Binary cross-entropy of the composited foreground probability against the mask, wherever the
+            # render has coverage. Every view votes, so a mask that eats part of the object in one frame is
+            # outvoted instead of deleting that surface, which is what costs 12.6 points in object mode.
+            label, label_alpha = gaussians.render_labels(views, [ref])
+            covered = label_alpha[0] > .1
+            if covered.any():
+                loss = loss + a.label_weight * F.binary_cross_entropy(
+                    label[0][covered].clamp(1e-6, 1 - 1e-6), views.masks[ref][covered])
         if priors is not None:
             prior_loss = priors.loss(ref, depth, a.prior_sigma, a.prior_clip)
             loss = loss + a.prior_weight * prior_loss
@@ -728,6 +814,17 @@ def main() -> None:
             np.save(a.output_dir / f'{number:08d}_grounded.npy', depth.cpu().numpy().astype(np.float32))
     if a.export_gaussians is not None:
         save_gaussians(gaussians, a.export_gaussians)
+    if a.export_labels is not None:
+        if a.label_solver == 'closed-form':
+            solved = solve_labels(gaussians, views, a.label_bias)
+            probability = solved.detach().cpu().numpy()
+        else:
+            with torch.no_grad():
+                probability = torch.sigmoid(gaussians.labels[:, 0]).cpu().numpy()
+        a.export_labels.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(a.export_labels, means=gaussians.means.detach().cpu().numpy(), foreground=probability)
+        print(f'Labels: {float((probability > .5).mean()) * 100:.1f}% of {len(probability):,} '
+              f'Gaussians foreground -> {a.export_labels}')
     summary = {'method': 'planar Gaussian refinement (PGSR-style losses, gsplat 2DGS rasteriser)', 'gaussians': len(xyz),
                'final_gaussians': len(gaussians.means), 'densification': grown,
                'priors': [list(x) for x in a.prior] if priors is not None else [], 'prior_weight': a.prior_weight,

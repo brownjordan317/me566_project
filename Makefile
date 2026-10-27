@@ -120,13 +120,19 @@ HYBRID_DEPTH := $(DEPTH_ROOT)/hybrid
 FUSION_ARGS ?=
 FUSION ?= 1
 DA3_CHECKPOINT ?= depth-anything/DA3-GIANT
-# DA3 input resolution: 756 beat 504 on every development scene (p90 5-11% lower); 1008 runs out of
-# memory on a 24 GB GPU.
+# DA3 input resolution: 756 beat 504 on every development scene (p90 5-11% lower).
 DA3_RES ?= 756
-# Extra recon.depth.multiview.da3 options. Memory is window x resolution, so a smaller window buys a
-# higher resolution: DA3_RES=1008 DA3_ARGS='--window 8 --step 4' lowers the median depth error on every
-# development scene (jeep -16%, audi -9%, convertible -7%, big_ben -2%) for about 1.5x the stage's time,
-# where 756 with the default window of 16 is simply where memory ran out (docs/PIPELINE.md).
+# Extra recon.depth.multiview.da3 options. Memory is window x resolution squared, and the stage now
+# sizes its own window to the free memory, so a higher resolution needs no hand-chosen window:
+# DA3_RES=1008 lowers the median depth error on every development scene (jeep -16%, audi -9%,
+# convertible -7%, big_ben -2%) for about 1.5x the stage's time, and picks a window of 9 where that
+# measurement used 8 (docs/PIPELINE.md).
+# Regions for the depth grounding's affine fit (1 = one global fit per frame, the long-standing
+# behaviour). A frame holding both a near and a far surface cannot be served by a single affine, which is
+# what costs an unmasked object run its thin surface (docs/PIPELINE.md); scenes have the widest range of
+# all. Passed to every depth stage.
+GROUNDING_REGIONS ?= 1
+GROUNDING_ARG = --grounding-regions $(GROUNDING_REGIONS)
 DA3_ARGS ?=
 FUSION_IMAGES ?= $(DATA)/$(SCENE)/image
 DA3_DEPTH := $(DEPTH_ROOT)/da3
@@ -255,7 +261,7 @@ PRUNE_COMMAND = test -n "$(SCENE)" && test -d "$(RUN)/poses" && rm -rf "$(DEPTH_
 	&& rm -f "$(POSE)"/*.log "$(MESHES)"/*.json "$(POINTS)"/*.json && echo 'Pruned intermediates in $(RUN)'
 PRUNE = $(if $(KEEP_INTERMEDIATE),,$(if $(filter $@,$(lastword $(MAKECMDGOALS))),@$(PRUNE_COMMAND)))
 
-.PHONY: watertight asset report view_ply stage-ranking prepare-dtu evaluate-dtu setup-vggt benchmark help setup setup-masks download prepare reconstruct rebuild-object construct poses depth scene object evaluate test status refine-masks setup-omega setup-patchmatch
+.PHONY: watertight asset segment report view_ply stage-ranking prepare-dtu evaluate-dtu setup-vggt benchmark help setup setup-masks download prepare reconstruct rebuild-object construct poses depth scene object evaluate test status refine-masks setup-omega setup-patchmatch
 
 help:
 	@echo 'Inputs are RGB frames plus object masks; cameras are estimated from the images.'
@@ -344,7 +350,7 @@ $(POSE)/summary.json: $(SEQ)/sequence.json $(if $(filter colmap,$(CAMERAS)),,$(F
 
 $(RAW)/moge_inference.json: $(POSE)/summary.json
 	@$(call stage,MoGe depth)
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.monocular.moge $(SEQ) --model $(MODEL) --output-dir $(RAW) $(MODEL_IMAGES_ARG) $(CHECKPOINT_ARG)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.monocular.moge $(SEQ) --model $(MODEL) --output-dir $(RAW) $(MODEL_IMAGES_ARG) $(CHECKPOINT_ARG) $(GROUNDING_ARG)
 
 $(TRAJECTORY): $(POSE)/summary.json
 	@$(call stage,Exporting poses)
@@ -357,7 +363,7 @@ $(LANDMARKS): $(POSE)/summary.json
 depth: $(CONSISTENT_DEPTH)/consistency.json
 $(SCENE_DEPTH)/moge_inference.json: $(POSE)/summary.json $(RAW)/moge_inference.json
 	@$(call stage,MoGe grounding (scene))
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.monocular.moge $(SEQ) --model $(MODEL) --output-dir $(SCENE_DEPTH) $(MODEL_IMAGES_ARG) --anchor-region all --reuse-raw-dir $(RAW) $(CHECKPOINT_ARG)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.monocular.moge $(SEQ) --model $(MODEL) --output-dir $(SCENE_DEPTH) $(MODEL_IMAGES_ARG) --anchor-region all --reuse-raw-dir $(RAW) $(CHECKPOINT_ARG) $(GROUNDING_ARG)
 
 scene: $(SCENE_MESH)
 object: $(FINAL_MESH)
@@ -368,7 +374,7 @@ $(FINAL_SCENE): $(MESHES)/%.ply: $(WORK)/%.ply
 # VGGT multiview depth inside the mask, anchored to the same COLMAP map.
 $(VGGT_DEPTH)/vggt_inference.json: $(POSE)/summary.json
 	@$(call stage,VGGT depth)
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.vggt $(SEQ) --model $(MODEL) $(MODEL_IMAGES_ARG) --output-dir $(VGGT_DEPTH) --window $(VGGT_WINDOW) --step $(VGGT_STEP) $(VGGT_CHECKPOINT_ARG)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.vggt $(SEQ) --model $(MODEL) $(MODEL_IMAGES_ARG) --output-dir $(VGGT_DEPTH) --window $(VGGT_WINDOW) --step $(VGGT_STEP) $(VGGT_CHECKPOINT_ARG) $(GROUNDING_ARG)
 
 $(HYBRID_DEPTH)/hybrid_depth.json: $(SCENE_DEPTH)/moge_inference.json $(PRIMARY_SUMMARY)
 	@$(call stage,Combining depth)
@@ -376,11 +382,11 @@ $(HYBRID_DEPTH)/hybrid_depth.json: $(SCENE_DEPTH)/moge_inference.json $(PRIMARY_
 
 $(DA3_DEPTH)/candidate.json: $(POSE)/summary.json
 	@$(call stage,DA3 depth)
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.da3 $(SEQ) --colmap-model $(MODEL) --output-dir $(DA3_DEPTH) --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES) $(MODEL_IMAGES_ARG) $(DA3_ARGS)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.da3 $(SEQ) --colmap-model $(MODEL) --output-dir $(DA3_DEPTH) --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES) $(MODEL_IMAGES_ARG) $(GROUNDING_ARG) $(DA3_ARGS)
 
 $(OMEGA_DEPTH)/candidate.json: $(POSE)/summary.json recon/depth/multiview/omega.py
 	@$(call stage,VGGT-Omega depth)
-	$(Q)$(GPU) $(PYTHON) -m recon.depth.multiview.omega $(SEQ) --colmap-model $(MODEL) $(MODEL_IMAGES_ARG) --masks-dir $(MASKS) --output-dir $(OMEGA_DEPTH) --checkpoint $(OMEGA_CHECKPOINT) --resolution $(OMEGA_RES) --resize-mode $(OMEGA_RESIZE_MODE) --window $(OMEGA_WINDOW) --step $(OMEGA_STEP)
+	$(Q)$(GPU) $(PYTHON) -m recon.depth.multiview.omega $(SEQ) --colmap-model $(MODEL) $(MODEL_IMAGES_ARG) --masks-dir $(MASKS) --output-dir $(OMEGA_DEPTH) --checkpoint $(OMEGA_CHECKPOINT) --resolution $(OMEGA_RES) --resize-mode $(OMEGA_RESIZE_MODE) --window $(OMEGA_WINDOW) --step $(OMEGA_STEP) $(GROUNDING_ARG)
 
 $(PATCHMATCH_DEPTH)/candidate.json: $(POSE)/summary.json recon/depth/multiview/patchmatch.py
 	@$(call stage,PatchMatch depth)
@@ -404,7 +410,7 @@ $(DA3_HEAD): $(REFINED_FUSED_DEPTH)/hybrid_depth.json recon/depth/multiview/da3_
 
 $(ADAPTED_DA3_DEPTH)/candidate.json: $(DA3_HEAD)
 	@$(call stage,DA3 depth (adapted))
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.da3 $(SEQ) --colmap-model $(MODEL) --output-dir $(ADAPTED_DA3_DEPTH) --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES) $(MODEL_IMAGES_ARG) --head-weights $(DA3_HEAD)
+	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.da3 $(SEQ) --colmap-model $(MODEL) --output-dir $(ADAPTED_DA3_DEPTH) --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES) $(MODEL_IMAGES_ARG) $(GROUNDING_ARG) --head-weights $(DA3_HEAD)
 
 $(ADAPTED_HYBRID_DEPTH)/hybrid_depth.json: $(ADAPTED_DA3_DEPTH)/candidate.json
 	@$(call stage,Combining depth (adapted))
@@ -497,6 +503,20 @@ $(ASSET_GLB): $(ASSET_MESH) $(SPLAT_VIEWS)/trajectory.csv recon/surface/texture.
 
 asset: $(ASSET_GLB)
 	@echo 'Asset:        $(abspath $(ASSET_GLB))'
+
+# Scene-first: reconstruct with no masks (white ones, OBJECT_TSDF=scene), then cut the object out of the
+# scene mesh with the real masks as supervision for a closed-form per-Gaussian labelling
+# (recon.surface.segment). SEGMENT_MASKS must be the real object masks, not the sequence's own.
+SEGMENT_MASKS ?= $(MASKS)
+SEGMENT_ARGS ?=
+SEGMENTED_MESH := $(MESHES)/object_segmented.ply
+$(SEGMENTED_MESH): $(FINAL_MESH) $(GAUSSIAN_PLY) recon/surface/segment.py
+	@$(call stage,3D segmentation)
+	$(Q)$(GPU) $(GAUSSIAN_PYTHON) -m recon.surface.segment $(SEQ) --model $(MODEL) --gaussians $(GAUSSIAN_PLY) \
+	  --mesh $(FINAL_MESH) --masks $(SEGMENT_MASKS) --output $@ $(SEGMENT_ARGS)
+
+segment: $(SEGMENTED_MESH)
+	@echo 'Segmented:    $(abspath $(SEGMENTED_MESH))'
 
 setup-gaussian:
 	python3 -m venv $(HOME)/.venvs/me566-pgsr
