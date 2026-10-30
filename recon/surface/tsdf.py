@@ -266,9 +266,17 @@ def main() -> None:
             color_image = o3d.t.geometry.Image(o3d.core.Tensor(color, device=device))
             K_tensor = o3d.core.Tensor(K, device=device)
             E_tensor = o3d.core.Tensor(extrinsic, device=device)
-            blocks = volume.compute_unique_block_coordinates(
-                depth_image, K_tensor, E_tensor, depth_scale=1.,
-                depth_max=a.max_depth, trunc_voxel_multiplier=truncation_voxels)
+            try:
+                blocks = volume.compute_unique_block_coordinates(
+                    depth_image, K_tensor, E_tensor, depth_scale=1.,
+                    depth_max=a.max_depth, trunc_voxel_multiplier=truncation_voxels)
+            except RuntimeError as error:
+                # Open3D raises rather than returning nothing when a frame touches no block (its valid depth all
+                # lies beyond depth_max or outside the grid), so one degenerate frame used to abort the fusion.
+                if 'No block is touched' not in str(error):
+                    raise
+                skipped += 1
+                continue
             if not len(blocks):                              # nothing of this frame lands in the grid
                 continue
             if box is not None:

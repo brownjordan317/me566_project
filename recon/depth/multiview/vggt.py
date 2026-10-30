@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import io
 import json
+import time
 import warnings
 from pathlib import Path
 
@@ -47,7 +48,9 @@ def unpad_depth(depth: np.ndarray, original_shape: tuple[int, int]) -> np.ndarra
                       interpolation=cv2.INTER_LINEAR)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None, network=None):
+    """Run the stage; `network` is an already-loaded VGGT to reuse (recon.depth.batch), and the loaded one is
+    returned so the next job can."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('sequence', type=Path)
     p.add_argument('--model', type=Path, required=True,
@@ -62,7 +65,7 @@ def main() -> None:
     p.add_argument('--max-frames', type=int)
     p.add_argument('--images', type=Path,
                    help='Full-resolution photos (numbered files) to feed VGGT instead of the working frames')
-    args = p.parse_args()
+    args = p.parse_args(argv)
     if args.window < 2 or args.step < 1 or args.step > args.window:
         p.error('Need window >= 2 and 1 <= step <= window')
     if args.max_frames is not None and args.max_frames < 2:
@@ -87,13 +90,19 @@ def main() -> None:
     if len(frames) < 2:
         p.error('Need at least two registered frames')
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    # huggingface_hub prints 'Loading weights from local directory' to stdout.
-    with spinner('Loading VGGT'), contextlib.redirect_stdout(io.StringIO()):
-        network = VGGT.from_pretrained(str(checkpoint)).cuda().eval()
-    # Camera/point/track heads are unnecessary for this depth comparison.
-    network.camera_head = None
-    network.point_head = None
-    network.track_head = None
+    load_s = 0.
+    if network is None:
+        started = time.perf_counter()
+        # huggingface_hub prints 'Loading weights from local directory' to stdout.
+        with spinner('Loading VGGT'), contextlib.redirect_stdout(io.StringIO()):
+            network = VGGT.from_pretrained(str(checkpoint)).cuda().eval()
+        # Camera/point/track heads are unnecessary for this depth comparison.
+        network.camera_head = None
+        network.point_head = None
+        network.track_head = None
+        torch.cuda.synchronize()
+        load_s = time.perf_counter() - started
+    inference_started = time.perf_counter()
     # Same aspect ratio as the working frames, so unpad_depth maps the prediction back unchanged.
     full = {int(path.stem): path for path in args.images.iterdir() if path.stem.isdigit()} if args.images else {}
     reports = []
@@ -136,10 +145,12 @@ def main() -> None:
                'images': str(args.images) if args.images else 'working frames',
                'registered_frames': len(frames),
                'saved_frames': sum(bool(row['saved']) for row in reports),
-               'checkpoint': str(checkpoint), 'reports': reports}
+               'checkpoint': str(checkpoint), 'load_s': load_s, 'model_reused': load_s == 0.,
+               'inference_s': time.perf_counter() - inference_started, 'reports': reports}
     (args.output_dir / 'vggt_inference.json').write_text(
         json.dumps(summary, indent=2) + '\n')
     done(f"VGGT depth: {summary['saved_frames']}/{len(frames)} frames grounded")
+    return network
 
 
 if __name__ == '__main__':

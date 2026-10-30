@@ -98,12 +98,14 @@ def main() -> None:
     parser.add_argument('--output', type=Path,
                         default=Path('runs/real/mobilebrick_dataset'))
     parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--split', choices=('test', 'train'), default='test',
+                        help='test: the 18 benchmark scenes; train: the 135 training scenes (11.4 GB)')
     args = parser.parse_args()
     with RemoteZip(URL) as archive:
         groups = defaultdict(list)
         for item in archive.infolist():
             parts = item.filename.split('/')
-            if len(parts) >= 3 and parts[0] == 'test':
+            if len(parts) >= 3 and parts[0] == args.split:
                 groups[parts[1]].append(item)
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(fetch_scene, name, entries, args.output): name
@@ -111,7 +113,7 @@ def main() -> None:
         for future in bar(as_completed(futures), total=len(futures),
                           desc='Downloading MobileBrick scenes', unit='scene'):
             future.result()
-    done(f'Downloaded {len(groups)} MobileBrick test scenes to {args.output}')
+    done(f'Downloaded {len(groups)} MobileBrick {args.split} scenes to {args.output}')
 
 
 if __name__ == '__main__':

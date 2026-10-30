@@ -49,3 +49,30 @@ def test_weakly_supported_drops_pieces_masked_in_few_views():
     drop = weakly_supported(ids, sizes, positives, .25, report)
     assert not drop[:9].any()
     assert drop[9:].all()
+
+
+def test_edge_band_lets_edge_views_abstain_only_with_enough_clear_views(tmp_path: Path):
+    # One point, seen by 6 frames: in 3 it lands deep inside the mask, in 3 just outside the mask's edge
+    # (a silhouette view). Without the band it fails an 80% vote (3/6); with it, the clear views decide (3/3).
+    masks, depths = tmp_path / 'masks', tmp_path / 'depths'
+    masks.mkdir()
+    depths.mkdir()
+    K = np.array([[10., 0., 15.], [0., 10., 15.], [0., 0., 1.]])
+    poses = {}
+    for frame in range(6):
+        mask = np.zeros((31, 31), dtype=np.uint8)
+        mask[5:26, 5:26] = 255 if frame < 3 else 0
+        if frame >= 3:
+            mask[5:26, 5:15] = 255                       # edge at column 15; the point lands on column 15
+        cv2.imwrite(str(masks / f'{frame:08d}.png'), mask)
+        np.save(depths / f'{frame:08d}_grounded.npy', np.full((31, 31), 2., dtype=np.float32))
+        poses[frame] = (np.eye(3), np.zeros(3))
+    point = np.array([[0., 0., 2.]])
+    args = dict(relative_tolerance=.02, absolute_tolerance=.05)
+    positive, visible = visible_mask_votes(point, masks, depths, poses, {f: K for f in poses}, **args)
+    assert (positive[0], visible[0]) == (3, 6)
+    positive, visible = visible_mask_votes(point, masks, depths, poses, {f: K for f in poses}, edge_band=2, **args)
+    assert (positive[0], visible[0]) == (3, 3)
+    # With fewer clear views than clear_min, every view votes again.
+    positive, visible = visible_mask_votes(point, masks, depths, poses, {f: K for f in poses}, edge_band=2, clear_min=4, **args)
+    assert (positive[0], visible[0]) == (3, 6)

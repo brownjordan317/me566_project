@@ -49,6 +49,27 @@ def affine_fit(prediction: np.ndarray, target: np.ndarray) -> tuple[float, float
     return float(scale), float(shift)
 
 
+def window_features(api, images: list[np.ndarray], extrinsics: np.ndarray, matrices: np.ndarray,
+                    process_res: int, head=None) -> tuple[list[torch.Tensor], tuple[int, int], torch.Tensor]:
+    """One window through DA3's frozen backbone: its feature layers (fp16, CPU), the processed image size
+    and the depth (S, H, W) of `head` (default: DA3's own). Call under torch.no_grad()."""
+    net = api.model
+    with contextlib.redirect_stdout(io.StringIO()):
+        imgs_cpu, ex, intr = api._preprocess_inputs(images, extrinsics, matrices, process_res, 'upper_bound_resize')
+        imgs, ex_t, in_t = api._prepare_model_inputs(imgs_cpu, ex, intr)
+        ex_n = api._normalize_extrinsics(ex_t.clone())
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        with torch.autocast('cuda', enabled=False):
+            token = net.cam_enc(ex_n, in_t, imgs.shape[-2:])
+        feats, _ = net.backbone(imgs, cam_token=token, export_feat_layers=[], ref_view_strategy='saddle_balanced')
+    height, width = imgs.shape[-2:]
+    layers = [feat[0].half().cpu() for feat in feats]                 # (1, S, N, C) each
+    base = (head or net.head)([(layer.cuda().float(),) for layer in layers], height, width, patch_start_idx=0)['depth']
+    del feats, imgs
+    torch.cuda.empty_cache()
+    return layers, (height, width), base[0].float().cpu()
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('sequence', type=Path)
@@ -84,21 +105,9 @@ def main() -> None:
     with torch.no_grad():
         for window in bar(windows(len(frames), a.window, a.step), desc='DA3 features', unit='window'):
             index = list(window)
-            with contextlib.redirect_stdout(io.StringIO()):
-                imgs_cpu, ex, intr = api._preprocess_inputs([images[i] for i in index], extrinsics[index],
-                                                            matrices[index], a.process_res, 'upper_bound_resize')
-                imgs, ex_t, in_t = api._prepare_model_inputs(imgs_cpu, ex, intr)
-                ex_n = api._normalize_extrinsics(ex_t.clone())
-            with torch.autocast('cuda', dtype=torch.bfloat16):
-                with torch.autocast('cuda', enabled=False):
-                    token = net.cam_enc(ex_n, in_t, imgs.shape[-2:])
-                feats, _ = net.backbone(imgs, cam_token=token, export_feat_layers=[], ref_view_strategy='saddle_balanced')
-            height, width = imgs.shape[-2:]
-            layers = [feat[0].half().cpu() for feat in feats]                 # (1, S, N, C) each
-            base = net.head([(layer.cuda().float(),) for layer in layers], height, width, patch_start_idx=0)['depth']
-            cache.append({'index': index, 'layers': layers, 'size': (height, width), 'base': base[0].float().cpu()})
-            del feats, imgs
-            torch.cuda.empty_cache()
+            layers, size, base = window_features(api, [images[i] for i in index], extrinsics[index],
+                                                 matrices[index], a.process_res)
+            cache.append({'index': index, 'layers': layers, 'size': size, 'base': base})
 
     # 2. Labels per (window, slot): targets in DA3's output scale, label mask, anchor mask.
     samples = []

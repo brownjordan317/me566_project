@@ -154,7 +154,7 @@ class Gaussians(torch.nn.Module):
         return rasterization_2dgs(self.means, F.normalize(self.quats, dim=-1), torch.exp(self.scales),
                                   torch.sigmoid(self.opacities), colors, views.viewmats[index],
                                   views.K[index], views.width, views.height, render_mode=mode,
-                                  sh_degree=self.sh_degree)
+                                  sh_degree=self.sh_degree, absgrad=getattr(self, 'absgrad', False))
 
     def render_labels(self, views: Views, index: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
         """Alpha-composite the foreground probability, with the geometry held fixed.
@@ -178,7 +178,7 @@ class Gaussians(torch.nn.Module):
         surface = surf_normals if surf_normals.dim() == 3 else surf_normals[0]    # no camera axis for one camera
         return {'image': colors[0, ..., :3].permute(2, 0, 1), 'depth': colors[0, ..., 3], 'alpha': alphas[0, ..., 0],
                 'normal': normals[0], 'depth_normal': surface, 'gradient': meta['gradient_2dgs'],
-                'radii': meta['radii'][0], 'regulariser': torch.zeros((), device=self.means.device)}
+                'means2d': meta['means2d'], 'radii': meta['radii'][0], 'regulariser': torch.zeros((), device=self.means.device)}
 
     def depth_only(self, views: Views, index: int, export: bool = False) -> torch.Tensor:
         colors, alphas, _, _, _, median, _ = self.render(views, [index], mode='ED')
@@ -303,7 +303,7 @@ class Gaussians3D(Gaussians):
         image, alphas, meta = rasterization(self.means, F.normalize(self.quats, dim=-1), torch.exp(self.scales),
                                             torch.sigmoid(self.opacities), colors, views.viewmats[index][None],
                                             views.K[index][None], views.width, views.height, sh_degree=self.sh_degree,
-                                            render_mode='RGB', packed=False)
+                                            render_mode='RGB', packed=False, absgrad=getattr(self, 'absgrad', False))
         depth, n_camera, alpha, _ = self._plane(views, index)
         rotation = views.viewmats[index][:3, :3]
         normal = n_camera @ rotation                       # camera -> world
@@ -368,11 +368,30 @@ def rebuild(gaussians: 'Gaussians', optimiser: torch.optim.Adam, keep: torch.Ten
         setattr(gaussians, name, new)
 
 
+def reset_opacity(gaussians: 'Gaussians', optimiser: torch.optim.Adam, ceiling: float = .01) -> None:
+    """Cap every opacity at `ceiling` and clear its Adam moments (3DGS / PGSR's opacity reset): Gaussians that
+    the images need regain opacity within a few hundred steps, and the rest - floaters, and surfels left
+    stacked in front of the true surface - fall under the pruning threshold."""
+    with torch.no_grad():
+        logit = math.log(ceiling / (1 - ceiling))
+        gaussians.opacities.data.clamp_(max=logit)
+        state = optimiser.state.get(gaussians.opacities)
+        if state:
+            state['exp_avg'].zero_()
+            state['exp_avg_sq'].zero_()
+
+
 def densify(gaussians: 'Gaussians', optimiser: torch.optim.Adam, gradient: torch.Tensor, threshold: float,
-            split_size: float, min_opacity: float) -> tuple[int, int, int]:
-    """Clone small and split large Gaussians whose mean screen gradient exceeds `threshold`; prune transparent ones."""
+            split_size: float, min_opacity: float, abs_gradient: torch.Tensor | None = None, abs_threshold: float = 0.,
+            too_big: torch.Tensor | None = None) -> tuple[int, int, int]:
+    """Clone small and split large Gaussians whose mean screen gradient exceeds `threshold` - or, with
+    `abs_threshold`, whose mean absolute gradient exceeds it (AbsGS, Ye et al. 2024, as PGSR uses: summed
+    per-pixel gradients cancel where a Gaussian covers detail it cannot fit, absolute ones do not); prune
+    transparent ones and those flagged `too_big` on screen."""
     with torch.no_grad():
         grow = gradient > threshold
+        if abs_gradient is not None and abs_threshold > 0:
+            grow |= abs_gradient > abs_threshold
         size = torch.exp(gaussians.scales).max(1).values
         large, small = grow & (size > split_size), grow & (size <= split_size)
         # Split: two surfels at random points of the parent's plane, 1.6× smaller.
@@ -392,6 +411,8 @@ def densify(gaussians: 'Gaussians', optimiser: torch.optim.Adam, gradient: torch
                  'shN': torch.cat([gaussians.shN[large]] * 2 + [gaussians.shN[small]]),
                  'labels': torch.cat([gaussians.labels[large]] * 2 + [gaussians.labels[small]])}
         keep = ~large & (torch.sigmoid(gaussians.opacities) > min_opacity)
+        if too_big is not None:
+            keep &= ~too_big
         pruned = int((~keep).sum()) - int(large.sum())
     rebuild(gaussians, optimiser, keep, added)
     return int(large.sum()), int(small.sum()), pruned
@@ -572,10 +593,11 @@ def multiview_losses(views: Views, ref: int, other: int, depth_ref, depth_other,
     ur, vr, _ = project(back, K_r)
     error = torch.sqrt((ur - u) ** 2 + (vr - v) ** 2 + 1e-12)                    # finite gradient at zero
     use = inside & (d_other > 0) & (error < threshold)
+    count = int(use.sum())                         # one GPU sync, shared by the gate and the log
     if stats is not None:
-        stats['sampled'] += len(u); stats['used'] += int(use.sum())
+        stats['sampled'] += len(u); stats['used'] += count
         stats['error_median'].append(float(error[inside & (d_other > 0)].median()) if (inside & (d_other > 0)).any() else float('nan'))
-    if use.sum() < 50:
+    if count < 50:
         return None
     weight = torch.exp(-error).detach()
     geometric = (weight * error)[use].mean()
@@ -680,6 +702,15 @@ def main() -> None:
     p.add_argument('--densify-from', type=int, default=500)
     p.add_argument('--densify-until', type=int, default=1500, help='0 turns densification off')
     p.add_argument('--densify-every', type=int, default=100)
+    p.add_argument('--representation', choices=('surfel', 'planar', 'planar-isotropic'), default='surfel',
+                   help='2DGS surfels, or PGSR-style flattened 3D Gaussians with plane depth (isotropic: start round '
+                        'and unrotated, as PGSR does from SfM points)')
+    p.add_argument('--opacity-reset-every', type=int, default=0,
+                   help='During densification, cap opacities at 0.01 every N iterations (PGSR / 3DGS: 3000; 0 = off)')
+    p.add_argument('--abs-grad-threshold', type=float, default=0.,
+                   help='Also grow Gaussians whose mean absolute screen gradient exceeds this (PGSR: 0.0008; 0 = off)')
+    p.add_argument('--max-screen-size', type=float, default=0.,
+                   help='After the first opacity reset, prune Gaussians wider than this many pixels (PGSR: 20; 0 = off)')
     p.add_argument('--grad-threshold', type=float, default=.0002, help='Mean screen-space gradient that triggers growth')
     p.add_argument('--split-size', type=float, default=.01, help='Surfels larger than this × scene radius are split')
     p.add_argument('--export', choices=('median', 'expected'), default='median',
@@ -707,8 +738,12 @@ def main() -> None:
         center, radius = normalisation(a.init_frame) if a.init_frame is not None else (np.zeros(3), 1.)
         gaussians = load_gaussians(a.init_gaussians, device, center, radius)
     else:
-        gaussians = Gaussians(xyz, rgb, normals, spacing, device, a.init_opacity, a.init_size)
-        gaussians.export = a.export
+        if a.representation == 'surfel':
+            gaussians = Gaussians(xyz, rgb, normals, spacing, device, a.init_opacity, a.init_size)
+            gaussians.export = a.export
+        else:                                    # PGSR's flattened 3D Gaussians with plane depth
+            gaussians = Gaussians3D(xyz, rgb, normals, spacing, device, a.init_opacity, a.init_size,
+                                    isotropic=a.representation == 'planar-isotropic')
     lr = lambda start, end, step: start * (end / start) ** min(step / a.iterations, 1)
     optimiser = torch.optim.Adam([
         {'params': [gaussians.means], 'lr': a.position_lr[0] * views.radius, 'name': 'means'},
@@ -726,7 +761,9 @@ def main() -> None:
     order = []
     accum = torch.zeros(len(gaussians.means), device=device)
     count = torch.zeros_like(accum)
-    grown = {'split': 0, 'cloned': 0, 'pruned': 0}
+    accum_abs, biggest = torch.zeros_like(accum), torch.zeros_like(accum)
+    gaussians.absgrad = a.abs_grad_threshold > 0
+    grown = {'split': 0, 'cloned': 0, 'pruned': 0, 'opacity_resets': 0}
     stats = {'sampled': 0, 'used': 0, 'error_median': [], 'terms': {'rgb': [], 'normal': [], 'geo': [], 'ncc': []},
              'active': 0, 'steps': 0}
     start_degree = gaussians.sh_degree                    # loaded Gaussians keep theirs
@@ -761,20 +798,27 @@ def main() -> None:
         if priors is not None:
             prior_loss = priors.loss(ref, depth, a.prior_sigma, a.prior_clip)
             loss = loss + a.prior_weight * prior_loss
-        stats['terms']['rgb'].append(float(rgb_loss)); stats['terms']['normal'].append(float(normal_loss))
+        # Logged values are read back only when they will be printed: each float() of a CUDA tensor makes the
+        # CPU wait for the GPU, and with --log-every 0 (the pipeline's default) they were synced and discarded
+        # several times a step.
+        logging = bool(a.log_every)
+        if logging:
+            stats['terms']['rgb'].append(float(rgb_loss)); stats['terms']['normal'].append(float(normal_loss))
         if step >= a.geo_from and near[ref]:
             stats['steps'] += 1
             other = int(near[ref][rng.integers(len(near[ref]))])
             depth_o = gaussians.depth_only(views, other)
             terms = multiview_losses(views, ref, other, depth, depth_o, normals_r, alpha,
-                                     a.samples, a.geo_threshold, stats, a.patch_step, a.geo_all_pixels, a.ncc_scale,
+                                     a.samples, a.geo_threshold, stats if logging else None, a.patch_step, a.geo_all_pixels, a.ncc_scale,
                                      a.squared_ncc)
             if terms is not None:
                 stats['active'] += 1
-                stats['terms']['geo'].append(float(terms[0]))
+                if logging:
+                    stats['terms']['geo'].append(float(terms[0]))
                 loss = loss + a.geo_weight * terms[0]
                 if terms[1] is not None:
-                    stats['terms']['ncc'].append(float(terms[1]))
+                    if logging:
+                        stats['terms']['ncc'].append(float(terms[1]))
                     loss = loss + a.ncc_weight * terms[1]
         if a.log_every and (step + 1) % a.log_every == 0:
             mean = lambda x: float(np.mean(x[-a.log_every:])) if x else float('nan')
@@ -795,17 +839,33 @@ def main() -> None:
                 seen = (radii > 0).all(-1) if radii.dim() == 2 else radii > 0
                 accum[seen] += grad.norm(dim=-1)[seen]
                 count[seen] += 1
+                if gaussians.absgrad:
+                    absolute = out.get('means2d', out['gradient']).absgrad[0].clone()   # 2DGS keeps it on means2d
+                    absolute[:, 0] *= views.width / 2
+                    absolute[:, 1] *= views.height / 2
+                    accum_abs[seen] += absolute.norm(dim=-1)[seen]
+                if a.max_screen_size:
+                    extent = radii.max(-1).values if radii.dim() == 2 else radii
+                    biggest = torch.maximum(biggest, extent.float())
         optimiser.step()
         if a.trim_every and (step + 1) % a.trim_every == 0 and step + 1 < a.iterations:
             grown['trimmed'] = grown.get('trimmed', 0) + trim(gaussians, optimiser, views, a.trim_views)
             accum = torch.zeros(len(gaussians.means), device=device)
             count = torch.zeros_like(accum)
+            accum_abs, biggest = torch.zeros_like(accum), torch.zeros_like(accum)
         if densifying and (step + 1) % a.densify_every == 0:
+            # As PGSR / 3DGS: screen-size pruning only once the first opacity reset has happened.
+            past_reset = a.opacity_reset_every and step + 1 > a.opacity_reset_every
             counts = densify(gaussians, optimiser, accum / count.clamp(min=1), a.grad_threshold,
-                             a.split_size * views.radius, .005)
+                             a.split_size * views.radius, .005, accum_abs / count.clamp(min=1), a.abs_grad_threshold,
+                             biggest > a.max_screen_size if (a.max_screen_size and past_reset) else None)
             grown['split'] += counts[0]; grown['cloned'] += counts[1]; grown['pruned'] += counts[2]
             accum = torch.zeros(len(gaussians.means), device=device)
             count = torch.zeros_like(accum)
+            accum_abs, biggest = torch.zeros_like(accum), torch.zeros_like(accum)
+        if densifying and a.opacity_reset_every and (step + 1) % a.opacity_reset_every == 0:
+            reset_opacity(gaussians, optimiser)
+            grown['opacity_resets'] += 1
     trained = time.time() - started - setup
     a.output_dir.mkdir(parents=True, exist_ok=True)
     with torch.no_grad():

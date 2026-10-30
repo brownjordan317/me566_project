@@ -9,6 +9,7 @@ time. The summary table is printed at the end.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -40,7 +41,7 @@ class Scene:
 
 
 def run_scene(scene: Scene, root: Path, make_vars: list[str], evaluation: list[list[str]],
-              scores_only: bool = False) -> None:
+              scores_only: bool = False, append: bool = False) -> None:
     scene.status, scene.start = 'running', time.monotonic()
     log = root / f'{scene.name}.log'
     env = dict(os.environ, NO_PROGRESS='1')
@@ -49,7 +50,7 @@ def run_scene(scene: Scene, root: Path, make_vars: list[str], evaluation: list[l
     # Scores need only the object mesh; reconstruct also builds texture, point clouds and the scene mesh.
     steps = evaluation if scores_only else [['reconstruct'], *evaluation]
     ok = True
-    with log.open('w') as stream:
+    with log.open('a' if append else 'w') as stream:          # the depth batch started this log
         for targets in steps:
             process = subprocess.Popen(base + targets, stdout=stream, stderr=subprocess.STDOUT,
                                        env=env)
@@ -61,6 +62,45 @@ def run_scene(scene: Scene, root: Path, make_vars: list[str], evaluation: list[l
                 break
     scene.stage = latest_stage(log) or scene.stage
     scene.status, scene.end = ('ok' if ok else 'failed'), time.monotonic()
+
+
+def batch_depth(scenes: list[Scene], root: Path, make_vars: list[str], seq_root: Path, jobs: int) -> None:
+    """Run every scene's depth models in one process, model by model, so each model loads once per benchmark.
+
+    Poses come first, for all scenes in parallel (the models need them); then each scene's depth jobs are
+    collected from `make depth-jobs` and run by one recon.depth.batch process, which keeps a model only until
+    the last scene that needs it. The per-scene pipelines then find their depth already built."""
+    env = dict(os.environ, NO_PROGRESS='1')
+
+    def scene_make(scene: Scene, *targets: str, capture: bool = False):
+        command = ['make', '--no-print-directory', '-j1', f'SCENE={scene.name}', f'RUN={root / scene.name}',
+                   *make_vars, f'MASKS={seq_root / scene.name / "masks"}', *targets]
+        if capture:
+            return subprocess.run(command + ['-s'], capture_output=True, text=True, env=env)
+        with (root / f'{scene.name}.log').open('w' if 'poses' in targets else 'a') as stream:
+            return subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, env=env)
+
+    def poses(scene: Scene) -> bool:
+        scene.status, scene.stage = 'running', 'Camera poses (before the depth batch)'
+        return scene_make(scene, 'poses').returncode == 0
+
+    with ThreadPoolExecutor(max(1, jobs)) as pool:
+        ready = [scene for scene, ok in zip(scenes, pool.map(poses, scenes)) if ok]
+    queued = []
+    for scene in ready:
+        result = scene_make(scene, 'depth-jobs', capture=True)
+        if result.returncode == 0:
+            queued += json.loads(result.stdout.strip().splitlines()[-1])
+        scene.stage = 'Depth models (batched across scenes)'
+    if not queued:
+        return
+    job_file = root / 'depth_jobs.json'
+    job_file.write_text(json.dumps(queued))
+    lock = next((v.split('=', 1)[1] for v in make_vars if v.startswith('GPU_LOCK=')), '/tmp/me566_gpu.lock')
+    with (root / 'depth_batch.log').open('w') as stream:
+        subprocess.run(['flock', lock, 'env', 'HF_HUB_OFFLINE=1', 'TRANSFORMERS_OFFLINE=1', sys.executable, '-m',
+                        'recon.depth.batch', str(job_file), '--skip-done', '--report', str(root / 'depth_batch.json')],
+                       stdout=stream, stderr=subprocess.STDOUT, env=env)
 
 
 def latest_stage(log: Path) -> str:
@@ -92,6 +132,9 @@ def main() -> None:
     p.add_argument('--dtu', action='store_true', help='Score with DTU chamfer instead')
     p.add_argument('--scores-only', action='store_true',
                    help='Build only what scoring needs (no texture, point clouds or scene mesh)')
+    p.add_argument('--depth-batch', action=argparse.BooleanOptionalAction, default=True,
+                   help='Run all scenes\' depth models in one process first, each model loaded once '
+                        '(recon.depth.batch); off runs them inside each scene\'s pipeline')
     p.add_argument('make_vars', nargs='*', help='Extra NAME=value settings passed to make')
     a = p.parse_args()
     a.root.mkdir(parents=True, exist_ok=True)
@@ -105,7 +148,7 @@ def main() -> None:
 
     def work(scene: Scene) -> None:
         masks = f'MASKS={a.seq_root / scene.name / "masks"}'
-        run_scene(scene, a.root, [*make_vars, masks], evaluation, a.scores_only)
+        run_scene(scene, a.root, [*make_vars, masks], evaluation, a.scores_only, append=a.depth_batch)
         progress.advance(task)
 
     with Live(dashboard(scenes, progress), console=console, refresh_per_second=2) as live:
@@ -118,6 +161,8 @@ def main() -> None:
 
         updater = threading.Thread(target=refresh, daemon=True)
         updater.start()
+        if a.depth_batch:
+            batch_depth(scenes, a.root, make_vars, a.seq_root, a.jobs)
         with ThreadPoolExecutor(max(1, a.jobs)) as pool:
             list(pool.map(work, scenes))
         stop.set()

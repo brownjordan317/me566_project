@@ -29,6 +29,103 @@ from recon.common.progress import done, spinner
 from recon.common.trajectory import load_poses
 
 
+def texel_faces(faces: np.ndarray, uvs: np.ndarray, size: int) -> tuple[np.ndarray, np.ndarray]:
+    """Which triangle covers each texel, and where in it: one ray per texel cast at the UV triangles laid flat.
+
+    Open3D's ray caster (Embree, multi-threaded) does in a fraction of a second what a per-triangle loop takes
+    seconds for. Returns per-texel face ids (-1 where no triangle covers it) and barycentric weights (N, 3).
+    Rows follow v without a flip, as texel_points and Open3D's albedo do."""
+    corners = uvs[faces] * (size - 1)                                         # (F, 3, 2) in texel units
+    flat = np.concatenate([corners, np.zeros((*corners.shape[:2], 1))], -1).reshape(-1, 3).astype(np.float32)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.core.Tensor(flat), o3d.core.Tensor(np.arange(len(flat), dtype=np.uint32).reshape(-1, 3)))
+    y, x = np.mgrid[:size, :size].astype(np.float32)
+    rays = np.stack([x, y, np.ones_like(x), np.zeros_like(x), np.zeros_like(x), -np.ones_like(x)], -1).reshape(-1, 6)
+    hit = scene.cast_rays(o3d.core.Tensor(rays))
+    ids = hit['primitive_ids'].numpy().astype(np.int64)
+    ids[ids == scene.INVALID_ID] = -1
+    b = hit['primitive_uvs'].numpy()                                         # weights of corners 1 and 2
+    return ids, np.stack([1 - b[:, 0] - b[:, 1], b[:, 0], b[:, 1]], 1).astype(np.float32)
+
+
+def pad_charts(albedo: np.ndarray, gutter: int) -> np.ndarray:
+    """Grow painted texels `gutter` texels outward into unpainted ones, each taking its painted neighbours' mean.
+
+    A texel is painted when its centre falls inside a triangle, so texels on a chart's edge are often left
+    black, and bilinear sampling near the edge then mixes black into the surface: a dark seam along every UV
+    cut. Padding the gutter with the chart's own edge colour is the standard remedy."""
+    colour = albedo.astype(np.float32)
+    painted = albedo.any(-1).astype(np.float32)
+    kernel = np.ones((3, 3), np.float32)
+    for _ in range(gutter):
+        total = cv2.filter2D(colour * painted[..., None], -1, kernel, borderType=cv2.BORDER_CONSTANT)
+        count = cv2.filter2D(painted, -1, kernel, borderType=cv2.BORDER_CONSTANT)
+        grow = (painted == 0) & (count > 0)
+        colour[grow] = total[grow] / count[grow, None]
+        painted[grow] = 1
+    return np.clip(np.rint(colour), 0, 255).astype(np.uint8)
+
+
+def bake_gpu(vertices: np.ndarray, faces: np.ndarray, uvs: np.ndarray, images: list[np.ndarray],
+             intrinsics: list[np.ndarray], world_to_camera: list[np.ndarray], size: int, power: float,
+             tolerance: float = .005, gutter: int = 4) -> np.ndarray:
+    """Albedo from calibrated photographs, baked on the GPU.
+
+    Every covered texel's surface point is projected into every photograph; it takes that photograph's
+    colour (bilinear, full resolution) where it is the first surface on the ray - its depth agrees with a
+    ray-cast depth map of the mesh to `tolerance` of the depth - weighted by cos(view angle) ** power, so a
+    head-on view outweighs a grazing one and a large power approaches choosing the best view per texel.
+    Unpainted texels are exactly zero, as Open3D's project_images_to_albedo leaves them."""
+    import torch
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    ids, bary = texel_faces(faces, uvs, size)
+    covered = np.nonzero(ids >= 0)[0]
+    corners = vertices[faces[ids[covered]]]                                   # (N, 3, 3)
+    normal = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+    points = torch.tensor((bary[covered, :, None] * corners).sum(1), dtype=torch.float32, device=device)
+    normal = torch.nn.functional.normalize(torch.tensor(normal, dtype=torch.float32, device=device), dim=-1)
+    mesh_scene = o3d.t.geometry.RaycastingScene()
+    mesh_scene.add_triangles(o3d.core.Tensor(vertices.astype(np.float32)), o3d.core.Tensor(faces.astype(np.uint32)))
+    total = torch.zeros(len(covered), 3, device=device)
+    weight = torch.zeros(len(covered), device=device)
+    for image, K, extrinsic in zip(images, intrinsics, world_to_camera):
+        height, width = image.shape[:2]
+        # Depth of the first surface along each pixel's ray, in camera z (rays have unit camera-z direction).
+        v, u = np.mgrid[:height, :width].astype(np.float32)
+        directions = np.stack(((u - K[0, 2]) / K[0, 0], (v - K[1, 2]) / K[1, 1], np.ones_like(u)), -1)
+        rotation, translation = extrinsic[:3, :3], extrinsic[:3, 3]
+        origin = -rotation.T @ translation
+        world = directions @ rotation                                         # camera -> world directions
+        rays = np.concatenate([np.broadcast_to(origin, world.shape), world], -1).reshape(-1, 6).astype(np.float32)
+        depth = mesh_scene.cast_rays(o3d.core.Tensor(rays))['t_hit'].numpy().reshape(height, width)
+        depth = torch.tensor(np.where(np.isfinite(depth), depth, 0), dtype=torch.float32, device=device)
+        R = torch.tensor(rotation, dtype=torch.float32, device=device)
+        t = torch.tensor(translation, dtype=torch.float32, device=device)
+        camera = points @ R.T + t
+        z = camera[:, 2]
+        px = K[0, 0] * camera[:, 0] / z.clamp(min=1e-6) + K[0, 2]
+        py = K[1, 1] * camera[:, 1] / z.clamp(min=1e-6) + K[1, 2]
+        inside = (z > 0) & (px >= 0) & (px <= width - 1) & (py >= 0) & (py <= height - 1)
+        nearest = depth[py.round().long().clamp(0, height - 1), px.round().long().clamp(0, width - 1)]
+        visible = inside & (nearest > 0) & ((nearest - z).abs() < tolerance * z)
+        to_camera = torch.nn.functional.normalize(torch.tensor(origin, dtype=torch.float32, device=device) - points, dim=-1)
+        cosine = (normal * to_camera).sum(-1).abs()                           # face winding is not reliable
+        w = torch.where(visible, cosine.clamp(min=0) ** power, torch.zeros_like(cosine))
+        grid = torch.stack([px / (width - 1) * 2 - 1, py / (height - 1) * 2 - 1], -1)[None, None]
+        picture = torch.tensor(image, dtype=torch.float32, device=device).permute(2, 0, 1)[None]
+        colour = torch.nn.functional.grid_sample(picture, grid, mode='bilinear', align_corners=True)[0, :, 0].T
+        total += colour * w[:, None]
+        weight += w
+    albedo = np.zeros((size * size, 3), np.uint8)
+    painted = (weight > 0).cpu().numpy()
+    albedo[covered[painted]] = (total[weight > 0] / weight[weight > 0, None]).round().clamp(0, 255).byte().cpu().numpy()
+    albedo = pad_charts(albedo.reshape(size, size, 3), gutter)
+    # Open3D's albedo, which everything downstream (fills, provenance, the glTF writer) is built on, runs its
+    # rows the other way: on jeep this atlas matched it to a mean of 7.8 levels once flipped vertically, and
+    # differed by 86-89 in every other orientation.
+    return np.ascontiguousarray(albedo[::-1])
+
+
 def texel_points(vertices: np.ndarray, faces: np.ndarray, uvs: np.ndarray,
                  size: int) -> tuple[np.ndarray, np.ndarray]:
     """The surface point behind each texel, by rasterising the UV triangles.
@@ -122,6 +219,11 @@ def main() -> None:
     p.add_argument('--fill-views', type=Path,
                    help='recon.surface.splat_views output; its renders fill texels the photos leave blank')
     p.add_argument('--fill-frames', type=int, default=48, help='Rendered views projected for the filling')
+    p.add_argument('--bake', choices=('open3d', 'gpu'), default='gpu',
+                   help="The GPU bake (bake_gpu; lower held-out colour error on all 18 MobileBrick scenes and "
+                        "about 44%% faster), or Open3D's CPU projection")
+    p.add_argument('--bake-power', type=float, default=4.,
+                   help='GPU bake: views weigh cos(view angle) ** this; larger approaches the single best view')
     p.add_argument('--projection-batch', type=int, default=0,
                    help='Images projected at once; 0 scales the batch to the atlas so memory stays flat')
     p.add_argument('--blank-level', type=float, default=8.,
@@ -161,7 +263,7 @@ def main() -> None:
             raise ValueError(f'No calibrated images in {source_images}')
         picked = [order[i] for i in np.unique(np.linspace(0, len(order) - 1,
                                                           min(count, len(order))).round().astype(int))]
-        images, Ks, extrinsics = [], [], []
+        images, Ks, extrinsics, raw = [], [], [], []
         for frame in picked:
             image = cv2.cvtColor(cv2.imread(str(available[frame])), cv2.COLOR_BGR2RGB)
             scale = image.shape[1] / width
@@ -172,9 +274,20 @@ def main() -> None:
             rotation, centre = source_poses[frame]                         # camera-to-world rotation, centre
             world_to_camera = np.eye(4)
             world_to_camera[:3, :3], world_to_camera[:3, 3] = rotation.T, -rotation.T @ centre
+            raw.append((image, K, world_to_camera))
             images.append(o3d.t.geometry.Image(np.ascontiguousarray(image)))
             Ks.append(o3d.core.Tensor(K, o3d.core.float32))
             extrinsics.append(o3d.core.Tensor(world_to_camera, o3d.core.float32))
+        if a.bake == 'gpu':
+            with spinner(f'Baking {len(picked)} images onto a {a.texture_size}px texture on the GPU'):
+                albedo = bake_gpu(np.asarray(seamed.vertices), np.asarray(seamed.triangles), uvs,
+                                  *map(list, zip(*raw)), a.texture_size, a.bake_power)
+            # project_images_to_albedo also gives the mesh a valid material; without one the glTF writer
+            # drops the texture and writes geometry only.
+            target.material.set_default_properties()
+            target.material.material_name = 'defaultUnlit'
+            target.material.texture_maps['albedo'] = o3d.t.geometry.Image(np.ascontiguousarray(albedo))
+            return albedo.copy(), picked, target
         # Open3D holds every image and the whole atlas in memory at once, so a large atlas with many
         # photos simply dies (8192 px with 43 images exhausts 23 GB). Projecting in batches and averaging
         # the batches where they overlap keeps memory flat in the image count, so the atlas size is a

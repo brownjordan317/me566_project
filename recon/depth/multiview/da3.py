@@ -22,6 +22,7 @@ import argparse
 import contextlib
 import io
 import json
+import time
 from pathlib import Path
 
 import cv2
@@ -57,7 +58,9 @@ def fitting_window(free_bytes: int, process_res: int, cap: int, fraction: float 
     return max(MIN_WINDOW, min(cap, int(budget / (WINDOW_PER_FRAME_GIB * tokens))))
 
 
-def main() -> None:
+def main(argv: list[str] | None = None, model=None):
+    """Run the stage; `model` is an already-loaded DA3 to reuse (recon.depth.batch), and it is returned. A reused
+    model must have been loaded with the same checkpoint and head weights; the batch driver keys on both."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('sequence', type=Path)
     p.add_argument('--colmap-model', type=Path, required=True)
@@ -79,14 +82,20 @@ def main() -> None:
                    help='Full-resolution photos (numbered files) to feed DA3 instead of the working frames')
     p.add_argument('--raw', action='store_true',
                    help='Save DA3 depth as predicted at our cameras\' scale, without the anchor fit')
-    a = p.parse_args()
+    a = p.parse_args(argv)
     from depth_anything_3.api import DepthAnything3
     intrinsics, points, frames = parse_model(a.colmap_model)
     points = point_table(points)
-    with spinner(f'Loading {a.checkpoint}'), contextlib.redirect_stdout(io.StringIO()):
-        model = DepthAnything3.from_pretrained(a.checkpoint).to('cuda').eval()
-    if a.head_weights is not None:
-        model.model.head.load_state_dict(torch.load(a.head_weights, map_location='cuda'))
+    load_s = 0.
+    if model is None:
+        started = time.perf_counter()
+        with spinner(f'Loading {a.checkpoint}'), contextlib.redirect_stdout(io.StringIO()):
+            model = DepthAnything3.from_pretrained(a.checkpoint).to('cuda').eval()
+        if a.head_weights is not None:
+            model.model.head.load_state_dict(torch.load(a.head_weights, map_location='cuda'))
+        torch.cuda.synchronize()
+        load_s = time.perf_counter() - started
+    inference_started = time.perf_counter()
     if a.window == 'auto':
         a.window = fitting_window(torch.cuda.mem_get_info()[0], a.process_res, a.max_window)
         print(f'Window {a.window} frames ({torch.cuda.mem_get_info()[0] / 2 ** 30:.1f} GiB free)')
@@ -157,11 +166,13 @@ def main() -> None:
     kept = sum(not row['rejected'] for row in reports)
     summary = {'model': a.checkpoint, 'images': str(a.images) if a.images else 'working frames', 'head_weights': str(a.head_weights) if a.head_weights else None,
                'poses_given': not a.no_poses, 'window': a.window, 'step': a.step,
+               'load_s': load_s, 'model_reused': load_s == 0., 'inference_s': time.perf_counter() - inference_started,
                'frames': len(reports), 'kept': kept,
                'median_scale': float(np.median([row['scale'] for row in reports if 'scale' in row])),
                'per_frame': reports}
     (a.output_dir / 'candidate.json').write_text(json.dumps(summary, indent=2) + '\n')
     done(f"DA3: {kept}/{len(reports)} frames grounded (fit scale {summary['median_scale']:.3f})")
+    return model
 
 
 if __name__ == '__main__':

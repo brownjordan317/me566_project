@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import time
 from pathlib import Path
 
 import cv2
@@ -19,7 +20,9 @@ from recon.common.progress import bar, done, spinner
 from recon.depth.grounding import fit_regionwise, object_anchors, point_table
 
 
-def main():
+def main(argv: list[str] | None = None, model=None):
+    """Run the stage; `model` is an already-loaded MoGe to reuse (recon.depth.batch), and the model is returned
+    (None when this job reused raw maps and needed none)."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('sequence', type=Path)
     parser.add_argument('--model', type=Path, required=True,
@@ -42,7 +45,7 @@ def main():
                         help='Discard frames whose fit is mostly a constant depth')
     parser.add_argument('--reuse-raw-dir', type=Path,
                         help='Reuse cached raw MoGe maps and skip model inference')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.checkpoint is None and args.version != 'v3':
         parser.error('--checkpoint is required for the MoGe-2 comparison')
     if args.checkpoint is None:
@@ -54,15 +57,19 @@ def main():
             parser.error(f'MoGe-3 weights are not cached: {error}')
     if not args.checkpoint.is_file():
         parser.error(f'Missing local MoGe checkpoint: {args.checkpoint}')
-    model = None
-    if args.reuse_raw_dir is None:
+    load_s = 0.
+    torch.set_grad_enabled(False)
+    if args.reuse_raw_dir is None and model is None:
         if args.version == 'v3':
             from moge.model.v3 import MoGeModel
         else:
             from moge.model.v2 import MoGeModel
-        torch.set_grad_enabled(False)
+        started = time.perf_counter()
         with spinner('Loading MoGe'):
             model = MoGeModel.from_pretrained(args.checkpoint).to('cuda').eval()
+        torch.cuda.synchronize()
+        load_s = time.perf_counter() - started
+    inference_started = time.perf_counter()
     intrinsics, points, frames = parse_model(args.model)
     points = point_table(points)
     if args.max_frames is not None:
@@ -150,6 +157,8 @@ def main():
                'refine_steps': args.refine_steps if args.version == 'v3' else 0,
                'anchor_region': args.anchor_region,
                'reused_raw': args.reuse_raw_dir is not None,
+               'load_s': load_s, 'model_reused': load_s == 0. and args.reuse_raw_dir is None,
+               'inference_s': time.perf_counter() - inference_started,
                'median_anchor_error': float(np.median(
                    [row['median_anchor_error'] for row in reports if not row['rejected']]
                    or [np.nan])),
@@ -158,6 +167,7 @@ def main():
     kept = sum(not row['rejected'] for row in reports)
     done(f'{label}: {kept}/{len(reports)} frames kept, median anchor error '
          f"{summary['median_anchor_error']:.3f} map units")
+    return model
 
 
 if __name__ == '__main__':

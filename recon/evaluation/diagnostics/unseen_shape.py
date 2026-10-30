@@ -15,6 +15,7 @@ far worse marks the surface where a prior would earn its place, and by how much.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 
@@ -33,6 +34,10 @@ def main() -> None:
     p.add_argument('--trajectory', type=Path, required=True)
     p.add_argument('--samples', type=int, default=120_000)
     p.add_argument('--tolerance', type=float, default=.002, help='Metres; depth agreement counted as seen')
+    p.add_argument('--seen-by', choices=('capture', 'trajectory'), default='capture',
+                   help="Which views count as having seen the surface: every frame of the dataset capture (the "
+                        "capture's own headroom), or only the frames in --trajectory (what a held-out "
+                        "reconstruction actually used, so the held-out views' surface counts as unseen)")
     p.add_argument('--output', type=Path)
     a = p.parse_args()
     reference = o3d.io.read_triangle_mesh(str(a.scene / 'mesh/gt_mesh.ply'))
@@ -42,6 +47,9 @@ def main() -> None:
     raycast.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(reference))
     seen = np.zeros(len(points), bool)
     frames = sorted(path.stem for path in (a.scene / 'pose').iterdir())
+    if a.seen_by == 'trajectory':
+        used = {int(row['frame']) for row in csv.DictReader(a.trajectory.open())}
+        frames = [name for name in frames if int(name) in used]
     for name in frames:
         mask = cv2.imread(str(a.scene / 'mask' / f'{name}.png'), cv2.IMREAD_GRAYSCALE)
         if mask is None:
@@ -58,6 +66,7 @@ def main() -> None:
     theirs.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(ours))
     distance = theirs.compute_distance(o3d.core.Tensor(points.astype(np.float32))).numpy() * 1000.
     report = {'mesh': str(a.mesh), 'scene': a.scene.name, 'samples': int(len(points)),
+              'seen_by': a.seen_by, 'seeing_frames': len(frames),
               'unseen_pct': float((~seen).mean() * 100)}
     for name, picked in (('observed', seen), ('unobserved', ~seen)):
         if picked.any():

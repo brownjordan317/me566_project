@@ -2,7 +2,7 @@
 
 This file records code in `recon/` that was adapted from other projects, with
 the licence notices those projects require. Libraries and models that are only
-called (COLMAP, LightGlue, SuperPoint, ALIKED, MoGe, VGGT, SAM-HQ, BiRefNet, 2DGS, Open3D, PyTorch,
+called (COLMAP, LightGlue, SuperPoint, ALIKED, MoGe, VGGT, DINOv2, SAM-HQ, BiRefNet, 2DGS, Open3D, PyTorch,
 gsplat, libigl, xatlas, scikit-image, SciPy) keep
 their own licences in `third_party/` or their packages; see the README's
 "Licences of components" and "Credits and citations" sections.
@@ -16,7 +16,10 @@ ECCV 2024, whose own release is under the research-only Gaussian-Splatting licen
 or vendored here). The methods the newer stages call are
 credited where they are used - the generalised winding number (Jacobson et al., SIGGRAPH 2013; Barill et
 al., SIGGRAPH 2018) through libigl in `recon/surface/watertight.py`, shape from silhouette (Laurentini,
-TPAMI 1994) for the visual hull there, and xatlas for UV unwrapping in `recon/surface/texture.py`.
+TPAMI 1994) for the visual hull there, and xatlas for UV unwrapping in `recon/surface/texture.py`. `recon/surface/denoise.py` reimplements
+bilateral normal filtering (Zheng et al., IEEE TVCG 2011) and its vertex update (Sun et al., IEEE TVCG 2007)
+from the papers, with none of their code, and `recon/depth/fusion/highlights.py` the multi-view
+diffuse-specular separation of Lin et al. (ECCV 2002) the same way.
 
 # Adapted code
 
@@ -175,6 +178,7 @@ SOFTWARE.
 | `recon/masks/birefnet.py`: `foreground` | Inference preprocessing (1024×1024 resize, ImageNet normalisation, sigmoid of the last output) | BiRefNet model card and `inference.py`, https://github.com/ZhengPeng7/BiRefNet (MIT, Copyright (c) 2024 ZhengPeng) |
 | `recon/evaluation/metrics/pose_auc.py` | Relative pose errors and AUC (`calculate_auc_np`, `rotation_angle`, `translation_angle`) | Depth Anything 3, `src/depth_anything_3/bench/utils.py` (Apache-2.0, ByteDance), after VGGT's CO3D evaluation and PoseDiffusion |
 | `recon/evaluation/baselines/twodgs.py`: `cull` | 2DGS's DTU mesh culling with dilated masks | 2DGS, `scripts/eval_dtu/evaluate_single_scene.py` (Gaussian-Splatting License) |
+| `recon/evaluation/baselines/pi3_feedforward.py` | π³'s input sizing (`load_images_as_tensor`) re-derived; intrinsics via π³'s own `recover_intrinsic_from_rays_d` | π³, `pi3/utils/basic.py`, `pi3/utils/geometry.py` (BSD-3-Clause; Pi3X weights CC BY-NC 4.0) |
 | `recon/evaluation/baselines/vggt_feedforward.py` | Inverse of VGGT's padded preprocessing for intrinsics; pose decoding via VGGT's own `pose_encoding_to_extri_intri` | VGGT, `vggt/utils/load_fn.py`, `vggt/utils/pose_enc.py` (VGGT License) |
 | `recon/evaluation/metrics/mesh.py`: `pose_similarity` | Chordal L2 rotation averaging | Hartley et al., "Rotation Averaging", IJCV 2013 (method) |
 | `recon/surface/tsdf.py` | VoxelBlockGrid integration sequence | Open3D, `examples/python/t_reconstruction_system/integrate.py` (MIT) |

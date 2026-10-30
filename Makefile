@@ -79,6 +79,9 @@ VGGT_MASK_VOTE ?= .8
 # Drop object pieces masked in fewer views than this fraction of the main piece (0: off). Removes
 # things a mask briefly covered (a chair in a few frames); neutral with complete masks.
 OBJECT_SUPPORT ?= .25
+# Pixels either side of the mask edge where a face abstains from the extraction vote (recon/surface/object.py
+# --edge-band; 0 = every visible view votes). Edge-on surface projects onto the silhouette and is voted out there.
+OBJECT_EDGE_BAND ?= 0
 TSDF_DEVICE ?= cuda
 # Scene surface must be seen by this many frames; fewer leaves floaters and shards.
 SCENE_MIN_VIEWS ?= 3
@@ -220,9 +223,20 @@ OBJECT_TSDF ?= weighted
 TSDF_ARGS ?=
 # Extra recon.surface.weighted_tsdf options, e.g. OBJECT_TSDF_ARGS='--voxel .01 --truncation .03'.
 OBJECT_TSDF_ARGS ?=
+# The weighted TSDF is a dense grid over the box of these landmarks. Scene-first runs on white masks, where the
+# sequence's own landmarks span the whole table (jeep 1.4 M -> 514 M voxels, big_ben 24 M -> 943 M, which does
+# not fit the card); pointing this at landmarks exported through the real masks keeps the box object-sized
+# while every pixel of depth inside it is still fused, so the masks bound the grid and delete nothing.
+WEIGHTED_LANDMARKS ?= $(LANDMARKS)
 WEIGHTED_OBJECT_MESH := $(WORK)/object_tsdf.ply
 OBJECT_SOURCE_MESH := $(if $(filter weighted,$(OBJECT_TSDF)),$(WEIGHTED_OBJECT_MESH),$(SCENE_MESH))
 FINAL_MESH := $(MESHES)/object.ply
+# Feature-preserving denoising (recon.surface.denoise) after cleanup: flat panels lose the millimetre bumps of
+# view-to-view disagreement while creases and studs stay. Chosen by eye (official and shape within +-0.15 and
+# +-0.01 on dev, docs/PIPELINE.md); DENOISE= keeps the cleaned mesh as it is.
+DENOISE ?= 1
+DENOISE_ARGS ?=
+CLEAN_MESH := $(WORK)/object_clean.ply
 # Textured copy of the object mesh (photos projected onto a UV atlas) for viewing; TEXTURE= skips it.
 TEXTURE ?= 1
 TEXTURED_MESH := $(MESHES)/object.glb
@@ -348,9 +362,6 @@ $(POSE)/summary.json: $(SEQ)/sequence.json $(if $(filter colmap,$(CAMERAS)),,$(F
 	@$(call stage,Camera poses)
 	$(Q)$(PYTHON) -m recon.cameras.solve --gpu-lock $(GPU_LOCK) $(CAMERAS_ARG) --sequence $(SEQ) $(INTRINSICS_ARG) --output $(POSE) --colmap $(COLMAP) --features $(FEATURES) --camera-model $(CAMERA_MODEL) --max-keypoints $(MAX_KEYPOINTS) $(if $(FEATURE_FRAMES),--feature-frames $(FEATURE_FRAMES) --scales $(FEATURE_SCALES),) $(if $(PER_FRAME_FOCAL),--per-frame-focal,) $(if $(LOOP_PAIRS),--loop,) --pairs $(PAIRS) $(if $(REFINE_PP),--refine-principal-point,) $(if $(NORMALIZE_DEPTH),--normalize-depth $(NORMALIZE_DEPTH),)
 
-$(RAW)/moge_inference.json: $(POSE)/summary.json
-	@$(call stage,MoGe depth)
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.monocular.moge $(SEQ) --model $(MODEL) --output-dir $(RAW) $(MODEL_IMAGES_ARG) $(CHECKPOINT_ARG) $(GROUNDING_ARG)
 
 $(TRAJECTORY): $(POSE)/summary.json
 	@$(call stage,Exporting poses)
@@ -361,9 +372,6 @@ $(LANDMARKS): $(POSE)/summary.json
 	$(Q)$(PYTHON) -m recon.cameras.export $(MODEL) $(POSE)/export_object --sequence $(SEQ)
 
 depth: $(CONSISTENT_DEPTH)/consistency.json
-$(SCENE_DEPTH)/moge_inference.json: $(POSE)/summary.json $(RAW)/moge_inference.json
-	@$(call stage,MoGe grounding (scene))
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.monocular.moge $(SEQ) --model $(MODEL) --output-dir $(SCENE_DEPTH) $(MODEL_IMAGES_ARG) --anchor-region all --reuse-raw-dir $(RAW) $(CHECKPOINT_ARG) $(GROUNDING_ARG)
 
 scene: $(SCENE_MESH)
 object: $(FINAL_MESH)
@@ -372,17 +380,49 @@ $(FINAL_SCENE): $(MESHES)/%.ply: $(WORK)/%.ply
 	$(Q)$(PYTHON) -m recon.surface.clean $< $@ --smooth-iterations 0 --min-fraction .05 --hole-size .08
 
 # VGGT multiview depth inside the mask, anchored to the same COLMAP map.
-$(VGGT_DEPTH)/vggt_inference.json: $(POSE)/summary.json
-	@$(call stage,VGGT depth)
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.vggt $(SEQ) --model $(MODEL) $(MODEL_IMAGES_ARG) --output-dir $(VGGT_DEPTH) --window $(VGGT_WINDOW) --step $(VGGT_STEP) $(VGGT_CHECKPOINT_ARG) $(GROUNDING_ARG)
 
 $(HYBRID_DEPTH)/hybrid_depth.json: $(SCENE_DEPTH)/moge_inference.json $(PRIMARY_SUMMARY)
 	@$(call stage,Combining depth)
 	$(Q)$(PYTHON) -m recon.depth.combine --scene-depth-dir $(SCENE_DEPTH) --object-depth-dir $(PRIMARY_DEPTH) --object-depth-kind grounded --masks-dir $(MASKS) --output-dir $(HYBRID_DEPTH)
 
+# The depth models: MoGe (raw and scene grounding), VGGT and DA3. With DEPTH_BATCH (the default) they run as
+# jobs in one process (recon.depth.batch), each model loaded once and dropped when no queued job needs it, so
+# start-up and weight loading are paid once rather than per stage; each stage's summary keeps its own load_s and
+# inference_s. DEPTH_BATCH= runs them as separate processes, with identical arguments and results.
+MOGE_RAW_JOB = $(SEQ) --model $(MODEL) --output-dir $(RAW) $(MODEL_IMAGES_ARG) $(CHECKPOINT_ARG) $(GROUNDING_ARG)
+MOGE_SCENE_JOB = $(SEQ) --model $(MODEL) --output-dir $(SCENE_DEPTH) $(MODEL_IMAGES_ARG) --anchor-region all --reuse-raw-dir $(RAW) $(CHECKPOINT_ARG) $(GROUNDING_ARG)
+VGGT_JOB = $(SEQ) --model $(MODEL) $(MODEL_IMAGES_ARG) --output-dir $(VGGT_DEPTH) --window $(VGGT_WINDOW) --step $(VGGT_STEP) $(VGGT_CHECKPOINT_ARG) $(GROUNDING_ARG)
+DA3_JOB = $(SEQ) --colmap-model $(MODEL) --output-dir $(DA3_DEPTH) --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES) $(MODEL_IMAGES_ARG) $(GROUNDING_ARG) $(DA3_ARGS)
+DEPTH_BATCH ?= 1
+USES_VGGT = $(if $(filter omega,$(DEPTH_MODEL)),,1)
+DEPTH_JOBS = --job moge '$(MOGE_RAW_JOB)' --job moge '$(MOGE_SCENE_JOB)' $(if $(USES_VGGT),--job vggt '$(VGGT_JOB)',) --job da3 '$(DA3_JOB)'
+DEPTH_ENV = env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+
+ifneq ($(DEPTH_BATCH),)
+$(RAW)/moge_inference.json $(SCENE_DEPTH)/moge_inference.json $(if $(USES_VGGT),$(VGGT_DEPTH)/vggt_inference.json,) $(DA3_DEPTH)/candidate.json &: $(POSE)/summary.json
+	@$(call stage,Depth models (MoGe, VGGT, DA3 in one process))
+	$(Q)$(GPU) $(DEPTH_ENV) $(PYTHON) -m recon.depth.batch $(DEPTH_JOBS) --report $(DEPTH_ROOT)/depth_batch.json
+else
+$(RAW)/moge_inference.json: $(POSE)/summary.json
+	@$(call stage,MoGe depth)
+	$(Q)$(GPU) $(DEPTH_ENV) $(PYTHON) -m recon.depth.monocular.moge $(MOGE_RAW_JOB)
+
+$(SCENE_DEPTH)/moge_inference.json: $(POSE)/summary.json $(RAW)/moge_inference.json
+	@$(call stage,MoGe grounding (scene))
+	$(Q)$(GPU) $(DEPTH_ENV) $(PYTHON) -m recon.depth.monocular.moge $(MOGE_SCENE_JOB)
+
+$(VGGT_DEPTH)/vggt_inference.json: $(POSE)/summary.json
+	@$(call stage,VGGT depth)
+	$(Q)$(GPU) $(DEPTH_ENV) $(PYTHON) -m recon.depth.multiview.vggt $(VGGT_JOB)
+
 $(DA3_DEPTH)/candidate.json: $(POSE)/summary.json
 	@$(call stage,DA3 depth)
-	$(Q)$(GPU) env HF_HUB_OFFLINE=1 $(PYTHON) -m recon.depth.multiview.da3 $(SEQ) --colmap-model $(MODEL) --output-dir $(DA3_DEPTH) --checkpoint $(DA3_CHECKPOINT) --process-res $(DA3_RES) $(MODEL_IMAGES_ARG) $(GROUNDING_ARG) $(DA3_ARGS)
+	$(Q)$(GPU) $(DEPTH_ENV) $(PYTHON) -m recon.depth.multiview.da3 $(DA3_JOB)
+endif
+
+# This scan's depth jobs as JSON, for assembling one batch over many scans (recon.evaluation.benchmark.run).
+depth-jobs:
+	@$(PYTHON) -m recon.depth.batch --print $(DEPTH_JOBS)
 
 $(OMEGA_DEPTH)/candidate.json: $(POSE)/summary.json recon/depth/multiview/omega.py
 	@$(call stage,VGGT-Omega depth)
@@ -428,17 +468,26 @@ $(SCENE_MESH): $(CONSISTENT_DEPTH)/consistency.json $(TRAJECTORY) recon/surface/
 	@$(call stage,TSDF fusion)
 	$(Q)$(GPU) $(PYTHON) -m recon.surface.tsdf $(SEQ) --model $(MODEL) --trajectory $(TRAJECTORY) --depth-dir $(CONSISTENT_DEPTH) --output $@ $(TSDF_ARGS)
 
-$(WEIGHTED_OBJECT_MESH): $(CONSISTENT_DEPTH)/consistency.json $(LANDMARKS) recon/surface/weighted_tsdf.py
+$(WEIGHTED_OBJECT_MESH): $(CONSISTENT_DEPTH)/consistency.json $(WEIGHTED_LANDMARKS) recon/surface/weighted_tsdf.py
 	@$(call stage,Weighted object TSDF)
-	$(Q)$(GPU) $(PYTHON) -m recon.surface.weighted_tsdf $(SEQ) --model $(MODEL) --depth-dir $(CONSISTENT_DEPTH) --landmarks $(LANDMARKS) --output $@ --angle-weight $(if $(FUSION),--agreement $(PRIMARY_DEPTH) $(AGREEMENT_DEPTH),) $(OBJECT_TSDF_ARGS)
+	$(Q)$(GPU) $(PYTHON) -m recon.surface.weighted_tsdf $(SEQ) --model $(MODEL) --depth-dir $(CONSISTENT_DEPTH) --landmarks $(WEIGHTED_LANDMARKS) --output $@ --angle-weight $(if $(FUSION),--agreement $(PRIMARY_DEPTH) $(AGREEMENT_DEPTH),) $(OBJECT_TSDF_ARGS)
 
 $(OBJECT_MESH): $(OBJECT_SOURCE_MESH) $(LANDMARKS)
 	@$(call stage,Object extraction)
-	$(Q)$(PYTHON) -m recon.surface.object $(OBJECT_SOURCE_MESH) --bounds-cloud $(LANDMARKS) --masks-dir $(MASKS) --depth-dir $(OBJECT_DEPTH_INPUT) --trajectory $(TRAJECTORY) --model $(MODEL) --output $@ --min-ratio $(VGGT_MASK_VOTE) --min-component-support $(OBJECT_SUPPORT)
+	$(Q)$(PYTHON) -m recon.surface.object $(OBJECT_SOURCE_MESH) --bounds-cloud $(LANDMARKS) --masks-dir $(MASKS) --depth-dir $(OBJECT_DEPTH_INPUT) --trajectory $(TRAJECTORY) --model $(MODEL) --output $@ --min-ratio $(VGGT_MASK_VOTE) --min-component-support $(OBJECT_SUPPORT) --edge-band $(OBJECT_EDGE_BAND)
 
-$(FINAL_MESH): $(OBJECT_MESH)
+$(CLEAN_MESH): $(OBJECT_MESH)
 	@$(call stage,Mesh cleanup)
 	$(Q)$(PYTHON) -m recon.surface.clean $< $@ --hole-size .08
+
+$(FINAL_MESH): $(CLEAN_MESH) $(if $(DENOISE),recon/surface/denoise.py,)
+ifneq ($(DENOISE),)
+	@$(call stage,Mesh denoising)
+	$(Q)$(PYTHON) -m recon.surface.denoise $< --output $@ $(DENOISE_ARGS)
+else
+	@mkdir -p $(@D)
+	$(Q)cp $< $@ && cp $(<:.ply=.json) $(@:.ply=.json)
+endif
 
 $(SCENE_POINTS) $(OBJECT_POINTS) &: $(CONSISTENT_DEPTH)/consistency.json $(TRAJECTORY) $(LANDMARKS) recon/surface/points.py
 	@$(call stage,Point clouds)
@@ -458,7 +507,7 @@ reconstruct: $(FINAL_MESH) $(if $(TEXTURE),$(TEXTURED_MESH),) $(call scene_mesh,
 # After changing MASKS: rebuild the mask-dependent depth and meshes (needs KEEP_INTERMEDIATE=1 runs).
 rebuild-object:
 	rm -rf $(HYBRID_DEPTH) $(FUSED_DEPTH) $(REFINED_FUSED_DEPTH) $(CONSISTENT_DEPTH) $(DA3_HEAD) $(ADAPTED_DA3_DEPTH) $(ADAPTED_HYBRID_DEPTH) $(ADAPTED_REFINED_DEPTH) $(GEOMETRIC_DEPTH) $(GAUSSIAN_DEPTH)
-	rm -f $(SCENE_MESH) $(OBJECT_MESH) $(FINAL_MESH) $(FINAL_SCENE) $(SCENE_POINTS) $(OBJECT_POINTS) $(METRICS)/object.json
+	rm -f $(SCENE_MESH) $(OBJECT_MESH) $(CLEAN_MESH) $(FINAL_MESH) $(FINAL_SCENE) $(SCENE_POINTS) $(OBJECT_POINTS) $(METRICS)/object.json
 	$(MAKE) reconstruct SCENE=$(SCENE) RUN=$(RUN) MASKS=$(MASKS)
 
 $(GAUSSIAN_DEPTH)/hybrid_depth.json: $(OBJECT_POINTS) $(CONSISTENT_DEPTH)/consistency.json recon/depth/gaussian_refine.py
@@ -470,7 +519,7 @@ $(GAUSSIAN_DEPTH)/hybrid_depth.json: $(OBJECT_POINTS) $(CONSISTENT_DEPTH)/consis
 # Second pass: optimise, then rebuild every depth-derived output from the optimised depth.
 refine-gaussian: $(GAUSSIAN_DEPTH)/hybrid_depth.json
 	rm -rf $(CONSISTENT_DEPTH)
-	rm -f $(SCENE_MESH) $(OBJECT_MESH) $(FINAL_MESH) $(FINAL_SCENE) $(SCENE_POINTS) $(OBJECT_POINTS) $(METRICS)/object.json
+	rm -f $(SCENE_MESH) $(OBJECT_MESH) $(CLEAN_MESH) $(FINAL_MESH) $(FINAL_SCENE) $(SCENE_POINTS) $(OBJECT_POINTS) $(METRICS)/object.json
 	$(MAKE) reconstruct SCENE=$(SCENE) RUN=$(RUN) MASKS=$(MASKS) OBJECT_DEPTH_INPUT=$(abspath $(GAUSSIAN_DEPTH))
 
 # The refinement stage writes the PLY beside its depth. It is deliberately *not* derived from that rule
@@ -495,10 +544,23 @@ watertight: $(WATERTIGHT_MESH)
 
 # A closed, textured asset: ASSET_MESH=$(FINAL_MESH) textures the open mesh instead, for a scene whose
 # closure is refused.
-$(ASSET_GLB): $(ASSET_MESH) $(SPLAT_VIEWS)/trajectory.csv recon/surface/texture.py
+# Specular-free photographs: each frame's highlights replaced by the other frames' consensus colour, aligned by
+# the cross-view-checked depth (recon.depth.fusion.highlights). HIGHLIGHT_FREE=1 textures the asset from them.
+HIGHLIGHTS := $(WORK)/highlights
+HIGHLIGHT_FREE ?=
+$(HIGHLIGHTS)/highlights.json: $(CONSISTENT_DEPTH)/consistency.json recon/depth/fusion/highlights.py
+	@$(call stage,Highlight removal)
+	$(Q)$(GPU) $(PYTHON) -m recon.depth.fusion.highlights $(SEQ) --model $(MODEL) --depth-dir $(CONSISTENT_DEPTH) \
+	  $(if $(TEXTURE_IMAGES),--images $(TEXTURE_IMAGES),) --output-dir $(HIGHLIGHTS)
+
+highlights: $(HIGHLIGHTS)/highlights.json
+	@echo 'Specular-free: $(abspath $(HIGHLIGHTS))'
+
+ASSET_IMAGES = $(if $(HIGHLIGHT_FREE),$(HIGHLIGHTS),$(TEXTURE_IMAGES))
+$(ASSET_GLB): $(ASSET_MESH) $(SPLAT_VIEWS)/trajectory.csv recon/surface/texture.py $(if $(HIGHLIGHT_FREE),$(HIGHLIGHTS)/highlights.json,)
 	@$(call stage,Textured asset)
 	$(Q)$(PYTHON) -m recon.surface.texture $(ASSET_MESH) --model $(MODEL) --trajectory $(TRAJECTORY) \
-	  --images $(TEXTURE_IMAGES) --sequence $(SEQ) --fill-views $(SPLAT_VIEWS) \
+	  --images $(ASSET_IMAGES) --sequence $(SEQ) --fill-views $(SPLAT_VIEWS) \
 	  --max-faces $(ASSET_MAX_FACES) --output $@
 
 asset: $(ASSET_GLB)
